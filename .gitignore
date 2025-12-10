@@ -1,3 +1,5 @@
 *.pdf
 target/
 Cargo.lock
+
+*.wsl
