@@ -3,6 +3,7 @@
 // Provides production-grade cryptographic implementations for the zkVM
 
 pub mod secure_random;
+pub mod signatures;
 
 pub use secure_random::{
     SecureRng,
@@ -12,4 +13,11 @@ pub use secure_random::{
     secure_random_bytes,
     secure_random_u64,
     secure_random_range,
+};
+
+pub use signatures::{
+    SignatureScheme,
+    AGMSignatureScheme,
+    BLSSignature,
+    SchnorrSignature,
 };

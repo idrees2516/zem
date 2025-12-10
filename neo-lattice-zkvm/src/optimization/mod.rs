@@ -1,17 +1,15 @@
-// Performance optimizations for Neo folding scheme
-//
-// This module implements:
-// - Task 17: Parallel processing
-// - Task 17.1: Memory pooling
-// - Task 17.2: Sparse matrix optimizations
-// - Task 17.3: NTT optimizations
+// Optimization module - Task 8
+// Implements Gruen's optimization, parallel proving, streaming, and cache optimization
 
-pub mod parallel;
-pub mod memory;
-pub mod sparse;
-pub mod ntt_opt;
+pub mod gruen;
+pub mod parallel_sumcheck;
+pub mod streaming;
+pub mod cache;
 
-pub use parallel::{ParallelConfig, parallel_commitment_batch, parallel_mle_evaluations};
-pub use memory::{MemoryPool, BufferPool};
-pub use sparse::{CSRMatrix, optimize_sparse_matmul};
-pub use ntt_opt::{NTTCache, precompute_twiddles};
+pub use gruen::{GruenSumCheckProver, GruenPerformanceComparison};
+pub use parallel_sumcheck::{ParallelSumCheckProver, ParallelConfig, ParallelPerformance};
+
+// Re-export existing optimization modules
+pub use crate::optimization::memory::MemoryPool;
+pub use crate::optimization::parallel::ParallelConfig as ExistingParallelConfig;
+pub use crate::optimization::sparse::SparseOptimization;

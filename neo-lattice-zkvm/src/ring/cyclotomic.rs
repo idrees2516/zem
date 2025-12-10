@@ -1,14 +1,27 @@
 // Cyclotomic ring implementation
 // R = Z[X]/(X^d + 1) for power-of-2 d
+// Extended for SALSAA: canonical embedding, trace, balanced representation
 
 use crate::field::Field;
 use super::ntt::NTT;
+use num_complex::Complex64;
+use std::f64::consts::PI;
 
 /// Cyclotomic ring R_q = F_q[X]/(X^d + 1)
+/// For SALSAA: K = Q(ζ) where ζ is primitive f-th root of unity
+/// R = O_K = Z[ζ] (ring of integers)
+/// R_q = R/qR (quotient ring)
 #[derive(Clone, Debug)]
 pub struct CyclotomicRing<F: Field> {
-    pub degree: usize,
+    pub degree: usize,              // φ = φ(f): Euler's totient
+    pub conductor: u64,             // f: conductor of cyclotomic field
+    pub modulus: u64,               // q: prime modulus
+    pub splitting_degree: usize,    // e: multiplicative order of q mod f
     pub ntt: Option<NTT<F>>,
+    
+    // Cached values for canonical embedding
+    primitive_roots: Vec<Complex64>, // ζ^k for k coprime to f
+    galois_automorphisms: Vec<usize>, // Indices of Galois automorphisms
 }
 
 /// Ring element: polynomial in R_q
@@ -24,10 +37,124 @@ impl<F: Field> CyclotomicRing<F> {
         assert!(degree.is_power_of_two(), "Degree must be power of 2");
         assert!(degree >= 64, "Degree must be at least 64 for security");
         
+        // For X^d + 1, conductor f = 2d (when d is power of 2)
+        let conductor = 2 * degree as u64;
+        let modulus = F::MODULUS;
+        
+        // Compute splitting degree e: multiplicative order of q mod f
+        let splitting_degree = Self::compute_splitting_degree(modulus, conductor);
+        
+        // Precompute primitive roots for canonical embedding
+        let primitive_roots = Self::compute_primitive_roots(conductor, degree);
+        
+        // Compute Galois automorphism indices
+        let galois_automorphisms = Self::compute_galois_automorphisms(conductor, degree);
+        
         // Try to initialize NTT if primitive root exists
         let ntt = NTT::try_new(degree);
         
-        Self { degree, ntt }
+        Self { 
+            degree, 
+            conductor,
+            modulus,
+            splitting_degree,
+            ntt,
+            primitive_roots,
+            galois_automorphisms,
+        }
+    }
+    
+    /// Compute multiplicative order of q modulo f
+    /// Returns smallest e such that q^e ≡ 1 (mod f)
+    fn compute_splitting_degree(q: u64, f: u64) -> usize {
+        let mut e = 1;
+        let mut power = q % f;
+        
+        while power != 1 && e < f as usize {
+            power = (power * q) % f;
+            e += 1;
+        }
+        
+        if power != 1 {
+            // q and f are not coprime or order doesn't exist
+            return 1;
+        }
+        
+        e
+    }
+    
+    /// Compute primitive f-th roots of unity for canonical embedding
+    /// Returns ζ^k for k ∈ (Z/fZ)× (units mod f)
+    fn compute_primitive_roots(f: u64, phi: usize) -> Vec<Complex64> {
+        let mut roots = Vec::with_capacity(phi);
+        
+        // ζ = e^{2πi/f}
+        let base_angle = 2.0 * PI / (f as f64);
+        
+        // Collect ζ^k for k coprime to f
+        for k in 1..=f {
+            if Self::gcd(k, f) == 1 {
+                let angle = base_angle * (k as f64);
+                roots.push(Complex64::new(angle.cos(), angle.sin()));
+            }
+        }
+        
+        assert_eq!(roots.len(), phi, "Number of primitive roots must equal φ(f)");
+        roots
+    }
+    
+    /// Compute indices for Galois automorphisms
+    /// Gal(K/Q) = {σ_k : ζ ↦ ζ^k | k ∈ (Z/fZ)×}
+    fn compute_galois_automorphisms(f: u64, phi: usize) -> Vec<usize> {
+        let mut autos = Vec::with_capacity(phi);
+        
+        for k in 1..=f {
+            if Self::gcd(k, f) == 1 {
+                autos.push(k as usize);
+            }
+        }
+        
+        assert_eq!(autos.len(), phi);
+        autos
+    }
+    
+    /// Greatest common divisor
+    fn gcd(mut a: u64, mut b: u64) -> u64 {
+        while b != 0 {
+            let temp = b;
+            b = a % b;
+            a = temp;
+        }
+        a
+    }
+    
+    /// Euler's totient function φ(n)
+    /// Returns count of integers k in [1,n] coprime to n
+    pub fn euler_totient(n: u64) -> usize {
+        if n == 1 {
+            return 1;
+        }
+        
+        let mut result = n;
+        let mut n_mut = n;
+        let mut p = 2;
+        
+        // For each prime factor p of n: φ(n) *= (1 - 1/p)
+        while p * p <= n_mut {
+            if n_mut % p == 0 {
+                while n_mut % p == 0 {
+                    n_mut /= p;
+                }
+                result -= result / p;
+            }
+            p += 1;
+        }
+        
+        if n_mut > 1 {
+            result -= result / n_mut;
+        }
+        
+        result as usize
     }
     
     /// Compute set operator norm: ∥S∥_op := max_{a∈S} ∥a∥_op
@@ -77,6 +204,132 @@ impl<F: Field> CyclotomicRing<F> {
     /// Check if NTT is available for this ring
     pub fn has_ntt(&self) -> bool {
         self.ntt.is_some()
+    }
+    
+    /// Canonical embedding σ: K → C^φ
+    /// For x ∈ R, computes σ(x) = (σ_j(x))_{j∈[φ]} where σ_j ∈ Gal(K/Q)
+    /// Each σ_j maps ζ ↦ ζ^{k_j} for k_j coprime to f
+    pub fn canonical_embedding(&self, elem: &RingElement<F>) -> Vec<Complex64> {
+        let mut result = Vec::with_capacity(self.degree);
+        
+        // For each Galois automorphism σ_j: ζ ↦ ζ^{k_j}
+        for &k in &self.galois_automorphisms {
+            // Evaluate polynomial at ζ^k
+            // x = Σ_i x_i ζ^i → σ_k(x) = Σ_i x_i (ζ^k)^i = Σ_i x_i ζ^{ki}
+            let mut value = Complex64::new(0.0, 0.0);
+            
+            for (i, coeff) in elem.coeffs.iter().enumerate() {
+                // Convert coefficient to balanced representation
+                let c_val = Self::to_balanced_i64(coeff.to_canonical_u64(), self.modulus);
+                let c_complex = Complex64::new(c_val as f64, 0.0);
+                
+                // Compute ζ^{ki mod f}
+                let power_index = (k * i) % (self.conductor as usize);
+                let root = self.get_root_power(power_index);
+                
+                value += c_complex * root;
+            }
+            
+            result.push(value);
+        }
+        
+        result
+    }
+    
+    /// Get ζ^k for any k (handles reduction mod f)
+    fn get_root_power(&self, k: usize) -> Complex64 {
+        let k_reduced = k % (self.conductor as usize);
+        
+        // Find which primitive root corresponds to ζ^k_reduced
+        // We need to map k_reduced to index in primitive_roots
+        let mut idx = 0;
+        for (i, &auto_k) in self.galois_automorphisms.iter().enumerate() {
+            if auto_k == k_reduced {
+                idx = i;
+                break;
+            }
+        }
+        
+        // If k_reduced is not coprime to f, compute directly
+        if idx == 0 && k_reduced != self.galois_automorphisms[0] {
+            let angle = 2.0 * PI * (k_reduced as f64) / (self.conductor as f64);
+            return Complex64::new(angle.cos(), angle.sin());
+        }
+        
+        self.primitive_roots[idx]
+    }
+    
+    /// Convert canonical u64 to balanced i64 representation
+    /// Maps [0, q) to [-(q-1)/2, (q-1)/2] for odd q
+    /// Maps [0, q) to [-q/2, q/2-1] for even q
+    fn to_balanced_i64(val: u64, q: u64) -> i64 {
+        if val <= q / 2 {
+            val as i64
+        } else {
+            -((q - val) as i64)
+        }
+    }
+    
+    /// Canonical norm squared: ∥x∥²_{σ,2} = Σ_j |σ_j(x)|²
+    /// This equals Trace(⟨x, x̄⟩) where x̄ is complex conjugate
+    pub fn canonical_norm_squared(&self, elem: &RingElement<F>) -> f64 {
+        let embedding = self.canonical_embedding(elem);
+        embedding.iter()
+            .map(|z| z.norm_sqr())
+            .sum()
+    }
+    
+    /// Field trace Trace_{K/Q}(x) = Σ_{σ_j ∈ Gal(K/Q)} σ_j(x)
+    /// Returns trace as integer (sum of all embeddings)
+    pub fn trace(&self, elem: &RingElement<F>) -> i64 {
+        let embedding = self.canonical_embedding(elem);
+        
+        // Sum real parts (imaginary parts cancel for elements in K)
+        let trace_real: f64 = embedding.iter()
+            .map(|z| z.re)
+            .sum();
+        
+        // Round to nearest integer
+        trace_real.round() as i64
+    }
+    
+    /// Trace of inner product: Trace(⟨x, y⟩) where ⟨x, y⟩ = Σ_i x_i ȳ_i
+    /// For vectors x, y ∈ R^m
+    pub fn trace_inner_product(&self, x: &[RingElement<F>], y: &[RingElement<F>]) -> i64 {
+        assert_eq!(x.len(), y.len());
+        
+        let mut total_trace = 0i64;
+        
+        for (x_i, y_i) in x.iter().zip(y.iter()) {
+            // Compute x_i * conjugate(y_i)
+            let y_i_conj = self.conjugate_ring_element(y_i);
+            let product = self.mul(x_i, &y_i_conj);
+            
+            // Add trace of product
+            total_trace += self.trace(&product);
+        }
+        
+        total_trace
+    }
+    
+    /// Complex conjugation in canonical embedding
+    /// For x ∈ K, computes x̄ such that σ(x̄) = conjugate(σ(x))
+    /// In polynomial representation: reverses and negates non-constant coefficients
+    pub fn conjugate_ring_element(&self, elem: &RingElement<F>) -> RingElement<F> {
+        elem.conjugate()
+    }
+    
+    /// Verify identity: ∥x∥²_{σ,2} = Trace(⟨x, x̄⟩)
+    /// Used for norm-check protocol correctness
+    pub fn verify_norm_trace_identity(&self, elem: &RingElement<F>) -> bool {
+        let norm_sq = self.canonical_norm_squared(elem);
+        
+        let elem_conj = self.conjugate_ring_element(elem);
+        let inner_prod = self.mul(elem, &elem_conj);
+        let trace_val = self.trace(&inner_prod);
+        
+        // Check if they're approximately equal (accounting for floating point error)
+        (norm_sq - trace_val as f64).abs() < 1e-6
     }
     
     /// Create zero ring element
@@ -190,6 +443,37 @@ impl<F: Field> RingElement<F> {
     /// Create ring element from coefficient vector
     pub fn from_coeffs(coeffs: Vec<F>) -> Self {
         Self { coeffs }
+    }
+    
+    /// Create ring element from balanced representation
+    /// Converts i64 coefficients in [-q/2, q/2] to field elements
+    pub fn from_balanced(coeffs: Vec<i64>, modulus: u64) -> Self {
+        let field_coeffs = coeffs.iter()
+            .map(|&c| {
+                if c >= 0 {
+                    F::from_u64(c as u64)
+                } else {
+                    F::from_u64((modulus as i64 + c) as u64)
+                }
+            })
+            .collect();
+        
+        Self { coeffs: field_coeffs }
+    }
+    
+    /// Convert to balanced representation
+    /// Returns coefficients as i64 in range [-(q-1)/2, (q-1)/2]
+    pub fn to_balanced(&self, modulus: u64) -> Vec<i64> {
+        self.coeffs.iter()
+            .map(|c| {
+                let val = c.to_canonical_u64();
+                if val <= modulus / 2 {
+                    val as i64
+                } else {
+                    -((modulus - val) as i64)
+                }
+            })
+            .collect()
     }
     
     /// Coefficient embedding: R_q → F_q^d

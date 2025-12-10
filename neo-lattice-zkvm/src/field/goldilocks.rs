@@ -114,13 +114,17 @@ impl Field for GoldilocksField {
     const MODULUS: u64 = Self::MODULUS;
     const MODULUS_BITS: usize = 64;
     const TWO_ADICITY: usize = 32;
+    const GENERATOR: u64 = 7; // Primitive root for Goldilocks
+    
+    const ZERO: Self = Self { value: 0 };
+    const ONE: Self = Self { value: 1 };
     
     fn zero() -> Self {
-        Self { value: 0 }
+        Self::ZERO
     }
     
     fn one() -> Self {
-        Self { value: 1 }
+        Self::ONE
     }
     
     fn from_u64(val: u64) -> Self {
@@ -131,6 +135,10 @@ impl Field for GoldilocksField {
                 val
             }
         }
+    }
+    
+    fn from_u128(val: u128) -> Self {
+        Self::reduce128(val)
     }
     
     fn to_canonical_u64(&self) -> u64 {
@@ -223,7 +231,81 @@ impl Field for GoldilocksField {
             r = r.mul(&b);
         }
     }
+    
+    fn random() -> Self {
+        // Simple random implementation using thread_rng
+        // In production, use a cryptographically secure RNG
+        use std::collections::hash_map::RandomState;
+        use std::hash::{BuildHasher, Hash, Hasher};
+        
+        let random_state = RandomState::new();
+        let mut hasher = random_state.build_hasher();
+        std::time::SystemTime::now().hash(&mut hasher);
+        let random_val = hasher.finish();
+        
+        Self::from_u64(random_val)
+    }
 }
+
+// Implement standard traits
+impl std::ops::Add for GoldilocksField {
+    type Output = Self;
+    
+    fn add(self, rhs: Self) -> Self::Output {
+        Field::add(&self, &rhs)
+    }
+}
+
+impl std::ops::Sub for GoldilocksField {
+    type Output = Self;
+    
+    fn sub(self, rhs: Self) -> Self::Output {
+        Field::sub(&self, &rhs)
+    }
+}
+
+impl std::ops::Mul for GoldilocksField {
+    type Output = Self;
+    
+    fn mul(self, rhs: Self) -> Self::Output {
+        Field::mul(&self, &rhs)
+    }
+}
+
+impl std::ops::Neg for GoldilocksField {
+    type Output = Self;
+    
+    fn neg(self) -> Self::Output {
+        Field::neg(&self)
+    }
+}
+
+impl From<u64> for GoldilocksField {
+    fn from(val: u64) -> Self {
+        Self::from_u64(val)
+    }
+}
+
+impl From<u32> for GoldilocksField {
+    fn from(val: u32) -> Self {
+        Self::from_u64(val as u64)
+    }
+}
+
+impl From<usize> for GoldilocksField {
+    fn from(val: usize) -> Self {
+        Self::from_u64(val as u64)
+    }
+}
+
+impl std::hash::Hash for GoldilocksField {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.value.hash(state);
+    }
+}
+
+// Type alias for convenience
+pub type Goldilocks = GoldilocksField;
 
 #[cfg(test)]
 mod tests {

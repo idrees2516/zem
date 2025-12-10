@@ -686,9 +686,109 @@ impl<F: Field> BatchedProof<F> {
         claims: &[PolyEvalClaim<F>],
         params: &HyperWolfParams<F>,
     ) -> Result<bool, BatchingError> {
-        // Verify combined proof
-        // In production, would verify the actual HyperWolf proof
-        Ok(true)
+        use super::pcs::HyperWolfPCS;
+        
+        if claims.is_empty() {
+            return Err(BatchingError::VerificationError {
+                reason: "No claims to verify".to_string(),
+            });
+        }
+        
+        // Verify all claims are at the same point
+        let first_point = &claims[0].eval_point;
+        for claim in &claims[1..] {
+            if !Self::eval_points_equal(first_point, &claim.eval_point) {
+                return Err(BatchingError::VerificationError {
+                    reason: "All claims must be at same evaluation point".to_string(),
+                });
+            }
+        }
+        
+        // Verify alphas match number of claims
+        if self.alphas.len() != claims.len() {
+            return Err(BatchingError::VerificationError {
+                reason: format!(
+                    "Alpha count mismatch: expected {}, got {}",
+                    claims.len(),
+                    self.alphas.len()
+                ),
+            });
+        }
+        
+        // Recompute combined polynomial and value
+        let combined_poly = self.combine_polynomials_for_verification(claims)?;
+        let combined_value = self.combine_values_for_verification(claims)?;
+        
+        // Convert evaluation point to PCS format
+        let pcs_eval_point = match first_point {
+            EvalPoint::Univariate(u) => super::pcs::EvalPoint::Univariate(*u),
+            EvalPoint::Multilinear(v) => super::pcs::EvalPoint::Multilinear(v.clone()),
+        };
+        
+        // Verify the combined HyperWolf proof
+        let verification_result = HyperWolfPCS::verify_eval(
+            params,
+            &self.combined_proof.commitment,
+            &pcs_eval_point,
+            combined_value,
+            &self.combined_proof,
+        );
+        
+        match verification_result {
+            Ok(valid) => Ok(valid),
+            Err(e) => Err(BatchingError::VerificationError {
+                reason: format!("HyperWolf verification failed: {}", e),
+            }),
+        }
+    }
+    
+    /// Combine polynomials for verification (recomputes linear combination)
+    fn combine_polynomials_for_verification(
+        &self,
+        claims: &[PolyEvalClaim<F>],
+    ) -> Result<Vec<F>, BatchingError> {
+        if claims.len() != self.alphas.len() {
+            return Err(BatchingError::DimensionMismatch {
+                expected: claims.len(),
+                actual: self.alphas.len(),
+            });
+        }
+        
+        let max_len = claims.iter()
+            .map(|c| c.polynomial.len())
+            .max()
+            .unwrap_or(0);
+        
+        let mut combined = vec![F::zero(); max_len];
+        
+        for (claim, &alpha) in claims.iter().zip(self.alphas.iter()) {
+            for (i, &coeff) in claim.polynomial.iter().enumerate() {
+                combined[i] = combined[i].add(&alpha.mul(&coeff));
+            }
+        }
+        
+        Ok(combined)
+    }
+    
+    /// Combine values for verification (recomputes linear combination)
+    fn combine_values_for_verification(
+        &self,
+        claims: &[PolyEvalClaim<F>],
+    ) -> Result<F, BatchingError> {
+        if claims.len() != self.alphas.len() {
+            return Err(BatchingError::DimensionMismatch {
+                expected: claims.len(),
+                actual: self.alphas.len(),
+            });
+        }
+        
+        let mut combined = F::zero();
+        
+        for (claim, &alpha) in claims.iter().zip(self.alphas.iter()) {
+            combined = combined.add(&alpha.mul(&claim.eval_value));
+        }
+        
+        Ok(combined)
     }
     
     fn verify_single_poly_multi_point(
@@ -696,15 +796,105 @@ impl<F: Field> BatchedProof<F> {
         claims: &[PolyEvalClaim<F>],
         params: &HyperWolfParams<F>,
     ) -> Result<bool, BatchingError> {
-        // Verify sum-check proof
-        if self.sumcheck_proof.is_none() {
-            return Err(BatchingError::VerificationError {
+        use super::pcs::HyperWolfPCS;
+        
+        // Verify sum-check proof exists
+        let sumcheck_proof = self.sumcheck_proof.as_ref()
+            .ok_or_else(|| BatchingError::VerificationError {
                 reason: "Missing sum-check proof".to_string(),
+            })?;
+        
+        if claims.is_empty() {
+            return Err(BatchingError::VerificationError {
+                reason: "No claims to verify".to_string(),
             });
         }
         
-        // Verify combined proof at random point
-        Ok(true)
+        // All claims should be for the same polynomial
+        let first_poly = &claims[0].polynomial;
+        for claim in &claims[1..] {
+            if claim.polynomial.len() != first_poly.len() {
+                return Err(BatchingError::VerificationError {
+                    reason: "All claims must be for same polynomial".to_string(),
+                });
+            }
+        }
+        
+        // Step 1: Verify sum-check protocol
+        // Claimed sum should equal Σᵢ αᵢvᵢ
+        let mut expected_sum = F::zero();
+        for (i, claim) in claims.iter().enumerate() {
+            if i < self.alphas.len() {
+                expected_sum = expected_sum.add(&self.alphas[i].mul(&claim.eval_value));
+            }
+        }
+        
+        if sumcheck_proof.claimed_sum != expected_sum {
+            return Err(BatchingError::VerificationError {
+                reason: format!(
+                    "Sum-check claimed sum mismatch: expected {:?}, got {:?}",
+                    expected_sum, sumcheck_proof.claimed_sum
+                ),
+            });
+        }
+        
+        // Step 2: Verify sum-check rounds
+        let num_rounds = sumcheck_proof.round_polynomials.len();
+        let mut prev_eval = sumcheck_proof.claimed_sum;
+        
+        for (round, round_poly) in sumcheck_proof.round_polynomials.iter().enumerate() {
+            // Verify degree bound (should be at most 2 for multilinear)
+            if round_poly.len() > 3 {
+                return Err(BatchingError::VerificationError {
+                    reason: format!("Round {} polynomial degree too high", round),
+                });
+            }
+            
+            // Verify consistency: prev_eval = round_poly(0) + round_poly(1)
+            if round > 0 {
+                let eval_0 = if round_poly.is_empty() { F::zero() } else { round_poly[0] };
+                let eval_1 = if round_poly.len() < 2 { F::zero() } else { round_poly[1] };
+                let sum = eval_0.add(&eval_1);
+                
+                // Allow small numerical error
+                if !Self::field_elements_close(&prev_eval, &sum) {
+                    return Err(BatchingError::VerificationError {
+                        reason: format!(
+                            "Round {} consistency check failed: prev {:?} != sum {:?}",
+                            round, prev_eval, sum
+                        ),
+                    });
+                }
+            }
+            
+            // Update prev_eval for next round
+            if round < sumcheck_proof.random_point.len() {
+                prev_eval = Self::evaluate_univariate(round_poly, &sumcheck_proof.random_point[round]);
+            }
+        }
+        
+        // Step 3: Verify combined proof at random point
+        let random_point = &sumcheck_proof.random_point;
+        let pcs_eval_point = super::pcs::EvalPoint::Multilinear(random_point.clone());
+        
+        // Evaluate polynomial at random point
+        let random_value = Self::evaluate_multilinear(first_poly, random_point)?;
+        
+        // Verify HyperWolf proof at random point
+        let verification_result = HyperWolfPCS::verify_eval(
+            params,
+            &self.combined_proof.commitment,
+            &pcs_eval_point,
+            random_value,
+            &self.combined_proof,
+        );
+        
+        match verification_result {
+            Ok(valid) => Ok(valid),
+            Err(e) => Err(BatchingError::VerificationError {
+                reason: format!("HyperWolf verification failed: {}", e),
+            }),
+        }
     }
     
     fn verify_multi_poly_multi_point(
@@ -712,15 +902,142 @@ impl<F: Field> BatchedProof<F> {
         claims: &[PolyEvalClaim<F>],
         params: &HyperWolfParams<F>,
     ) -> Result<bool, BatchingError> {
-        // Verify sum-check proof
-        if self.sumcheck_proof.is_none() {
-            return Err(BatchingError::VerificationError {
+        // Verify sum-check proof exists
+        let sumcheck_proof = self.sumcheck_proof.as_ref()
+            .ok_or_else(|| BatchingError::VerificationError {
                 reason: "Missing sum-check proof".to_string(),
+            })?;
+        
+        if claims.is_empty() {
+            return Err(BatchingError::VerificationError {
+                reason: "No claims to verify".to_string(),
             });
         }
         
-        // Verify batched single-point proof
-        Ok(true)
+        // Step 1: Verify sum-check protocol (similar to single poly case)
+        let mut expected_sum = F::zero();
+        let mut alpha_idx = 0;
+        
+        for claim in claims {
+            if alpha_idx < self.alphas.len() {
+                expected_sum = expected_sum.add(&self.alphas[alpha_idx].mul(&claim.eval_value));
+                alpha_idx += 1;
+            }
+        }
+        
+        if sumcheck_proof.claimed_sum != expected_sum {
+            return Err(BatchingError::VerificationError {
+                reason: "Sum-check claimed sum mismatch".to_string(),
+            });
+        }
+        
+        // Step 2: Verify sum-check rounds
+        let mut prev_eval = sumcheck_proof.claimed_sum;
+        
+        for (round, round_poly) in sumcheck_proof.round_polynomials.iter().enumerate() {
+            if round_poly.len() > 3 {
+                return Err(BatchingError::VerificationError {
+                    reason: format!("Round {} polynomial degree too high", round),
+                });
+            }
+            
+            if round > 0 {
+                let eval_0 = if round_poly.is_empty() { F::zero() } else { round_poly[0] };
+                let eval_1 = if round_poly.len() < 2 { F::zero() } else { round_poly[1] };
+                let sum = eval_0.add(&eval_1);
+                
+                if !Self::field_elements_close(&prev_eval, &sum) {
+                    return Err(BatchingError::VerificationError {
+                        reason: format!("Round {} consistency check failed", round),
+                    });
+                }
+            }
+            
+            if round < sumcheck_proof.random_point.len() {
+                prev_eval = Self::evaluate_univariate(round_poly, &sumcheck_proof.random_point[round]);
+            }
+        }
+        
+        // Step 3: Verify batched single-point proof at random point
+        // This reduces to the multi-poly single-point case
+        let random_point = &sumcheck_proof.random_point;
+        
+        // Create single-point claims at random point
+        let mut single_point_claims = Vec::new();
+        for claim in claims {
+            let random_value = Self::evaluate_multilinear(&claim.polynomial, random_point)?;
+            single_point_claims.push(PolyEvalClaim {
+                polynomial: claim.polynomial.clone(),
+                commitment: claim.commitment.clone(),
+                eval_point: EvalPoint::Multilinear(random_point.clone()),
+                eval_value: random_value,
+                is_multilinear: claim.is_multilinear,
+            });
+        }
+        
+        // Verify as multi-poly single-point
+        self.verify_multi_poly_single_point(&single_point_claims, params)
+    }
+    
+    /// Check if two field elements are close (within numerical error)
+    fn field_elements_close(a: &F, b: &F) -> bool {
+        // For exact fields, should be equal
+        // For approximate fields, allow small error
+        a == b
+    }
+    
+    /// Evaluate univariate polynomial at point
+    fn evaluate_univariate(poly: &[F], point: &F) -> F {
+        if poly.is_empty() {
+            return F::zero();
+        }
+        
+        // Horner's method: p(x) = a₀ + x(a₁ + x(a₂ + ...))
+        let mut result = poly[poly.len() - 1];
+        for i in (0..poly.len() - 1).rev() {
+            result = poly[i].add(&point.mul(&result));
+        }
+        result
+    }
+    
+    /// Evaluate multilinear polynomial at point
+    fn evaluate_multilinear(poly: &[F], point: &[F]) -> Result<F, BatchingError> {
+        let num_vars = (poly.len() as f64).log2() as usize;
+        
+        if point.len() != num_vars {
+            return Err(BatchingError::DimensionMismatch {
+                expected: num_vars,
+                actual: point.len(),
+            });
+        }
+        
+        // Multilinear evaluation: ã(r) = Σ_{x∈{0,1}^n} a(x) · eq̃(r,x)
+        let mut result = F::zero();
+        
+        for (idx, &coeff) in poly.iter().enumerate() {
+            // Convert index to binary
+            let mut x = Vec::with_capacity(num_vars);
+            let mut temp_idx = idx;
+            for _ in 0..num_vars {
+                x.push(temp_idx & 1 == 1);
+                temp_idx >>= 1;
+            }
+            
+            // Compute eq̃(r,x) = Π_i ((1-r_i)(1-x_i) + r_i·x_i)
+            let mut eq_val = F::one();
+            for (i, &x_i) in x.iter().enumerate() {
+                let term = if x_i {
+                    point[i]
+                } else {
+                    F::one().sub(&point[i])
+                };
+                eq_val = eq_val.mul(&term);
+            }
+            
+            result = result.add(&coeff.mul(&eq_val));
+        }
+        
+        Ok(result)
     }
     
     /// Get proof size in field elements

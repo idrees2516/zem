@@ -6,6 +6,11 @@
 // - Task 15.2: Module-SIS security verification
 // - Task 15.3: Soundness error computation
 // - Task 15.4: Parameter validation
+// - Task 12.1: Parameter selection logic
+// - Task 12.2: Commitment scheme selection
+
+pub mod selection;
+pub mod commitment_selection;
 
 use crate::field::{Field, GoldilocksField, M61Field};
 use std::fmt;

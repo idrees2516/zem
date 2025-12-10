@@ -9,6 +9,7 @@ mod integer_ring_map;
 mod monomial;
 mod projection;
 mod decomposition;
+pub mod crt;  // SALSAA: Chinese Remainder Theorem operations
 
 pub use cyclotomic::{CyclotomicRing, RingElement};
 pub use ntt::NTT;
@@ -21,3 +22,4 @@ pub use projection::{
     ProjectionMatrix, ProjectionParams, ProjectedWitness, ChiValue
 };
 pub use decomposition::{DecompositionParams, NormDecomposition, GadgetParams, GadgetDecomposition, decompose_vector};
+pub use crt::{CRTContext, ExtFieldElement};
