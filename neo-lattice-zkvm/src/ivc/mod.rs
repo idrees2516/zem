@@ -21,6 +21,7 @@ pub mod circuit;
 pub mod reduction;
 pub mod types;
 pub mod errors;
+pub mod snark_builder;
 
 pub use incremental_computation::IncrementalComputation;
 pub use depth_predicates::DepthPredicates;
@@ -31,3 +32,4 @@ pub use circuit::RecursiveVerificationCircuit;
 pub use reduction::{IVCSecurityReduction, IVCAdversary, IVCAdversaryOutput, SNARKAdversaryOutput};
 pub use types::{IVCState, IVCWitness, IVCProof};
 pub use errors::{IVCError, IVCResult};
+pub use snark_builder::{SNARKBuilder, SNARKSystem, SNARKConfig, SNARKProof, ConstraintSystemType};

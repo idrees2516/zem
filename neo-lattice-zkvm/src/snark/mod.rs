@@ -6,6 +6,8 @@ pub mod compiler;
 pub mod cp_snark;
 pub mod symphony;
 pub mod extraction;
+pub mod monomial_embedding;
+pub mod structured_projection;
 pub mod neo_integration;
 pub mod speedy_spartan;
 pub mod spartan_plusplus;
@@ -17,6 +19,12 @@ pub use compiler::{CPSNARKCompiler, CompilerProof};
 pub use cp_snark::{CPSNARKRelation, CPSNARKInstance, CPSNARKWitness, CPSNARKProof};
 pub use symphony::{SymphonySNARK, SymphonyProof, SymphonyParams};
 pub use extraction::{WitnessExtractor, ExtractedWitness};
+pub use monomial_embedding::{
+    MonomialSet, TablePolynomial, MonomialRangeProof, MonomialRangeProver,
+};
+pub use structured_projection::{
+    StructuredProjection, ProjectionProof, ProjectionProver,
+};
 pub use neo_integration::{SymphonyNeoIntegration, estimate_cost_savings};
 pub use speedy_spartan::{SpeedySpartan, SpeedySpartanProof, PlonkishGate, GateType};
 pub use spartan_plusplus::{SpartanPlusPlus, SpartanPlusPlusProof, CCS, SparseMatrix};

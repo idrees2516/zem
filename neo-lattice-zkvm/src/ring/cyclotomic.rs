@@ -206,6 +206,92 @@ impl<F: Field> CyclotomicRing<F> {
         self.ntt.is_some()
     }
     
+    /// Compute CRT decomposition R_q ≅ (F_{q^e})^{φ/e}
+    /// 
+    /// **Paper Reference**: SALSAA Section 2.2 "Ring Splitting and Incomplete NTT"
+    /// 
+    /// **Mathematical Background**:
+    /// When q has multiplicative order e modulo the conductor f (meaning q^e ≡ 1 mod f),
+    /// the cyclotomic ring R_q splits into φ/e components over the extension field F_{q^e}.
+    /// This is the Chinese Remainder Theorem (CRT) for rings.
+    /// 
+    /// **Why This Matters**:
+    /// - For small e (e.g., e = 2, 4, 8), we can use "incomplete NTT" which is more efficient
+    /// - Each CRT slot can be processed independently, enabling parallelization
+    /// - Reduces communication in protocols by a factor of e
+    /// 
+    /// **Implementation**:
+    /// We use the NTT's CRT splitting functionality to decompose the ring element
+    /// into φ/e slots, where each slot is a polynomial of degree e over F_{q^e}.
+    /// 
+    /// **Supported Splitting Degrees**: e ∈ {1, 2, 4, 8} as per Requirement 1.3
+    pub fn to_crt(&self, elem: &RingElement<F>) -> Vec<Vec<F>> {
+        if let Some(ref ntt) = self.ntt {
+            // Use NTT's CRT splitting for efficient decomposition
+            ntt.apply_crt_splitting(&elem.coeffs)
+        } else {
+            // Fallback: return single slot containing all coefficients
+            vec![elem.coeffs.clone()]
+        }
+    }
+    
+    /// Reconstruct ring element from CRT decomposition
+    /// 
+    /// **Paper Reference**: SALSAA Section 2.2
+    /// 
+    /// This is the inverse operation of to_crt(). It takes the φ/e CRT slots
+    /// and reconstructs the original ring element using the Chinese Remainder Theorem.
+    pub fn from_crt(&self, slots: &[Vec<F>]) -> RingElement<F> {
+        if let Some(ref ntt) = self.ntt {
+            let coeffs = ntt.inverse_crt_splitting(slots);
+            RingElement { coeffs }
+        } else {
+            // Fallback: assume single slot
+            RingElement { coeffs: slots[0].clone() }
+        }
+    }
+    
+    /// Get the splitting degree e for this ring
+    /// 
+    /// **Paper Reference**: SALSAA Section 2.2
+    /// 
+    /// The splitting degree e is the multiplicative order of q modulo f,
+    /// i.e., the smallest positive integer such that q^e ≡ 1 (mod f).
+    /// 
+    /// For Goldilocks field (q = 2^64 - 2^32 + 1), e = 32.
+    pub fn get_splitting_degree(&self) -> usize {
+        self.splitting_degree
+    }
+    
+    /// Get number of CRT slots: φ/e
+    /// 
+    /// **Paper Reference**: SALSAA Section 2.2
+    /// 
+    /// This tells us how many independent components the ring splits into.
+    /// Each slot can be processed in parallel.
+    pub fn get_num_crt_slots(&self) -> usize {
+        if let Some(ref ntt) = self.ntt {
+            ntt.num_crt_slots()
+        } else {
+            1
+        }
+    }
+    
+    /// Verify the CRT isomorphism R_q ≅ (F_{q^e})^{φ/e}
+    /// 
+    /// **Paper Reference**: SALSAA Section 2.2
+    /// 
+    /// This checks that the ring splitting is valid, which requires:
+    /// 1. q^e ≡ 1 (mod f) where f is the conductor
+    /// 2. e divides φ (Euler's totient of f)
+    pub fn verify_crt_isomorphism(&self) -> bool {
+        if let Some(ref ntt) = self.ntt {
+            ntt.verify_isomorphism()
+        } else {
+            true // Trivial case: no splitting
+        }
+    }
+    
     /// Canonical embedding σ: K → C^φ
     /// For x ∈ R, computes σ(x) = (σ_j(x))_{j∈[φ]} where σ_j ∈ Gal(K/Q)
     /// Each σ_j maps ζ ↦ ζ^{k_j} for k_j coprime to f
@@ -598,6 +684,76 @@ impl<F: Field> RingElement<F> {
                 }
             })
             .sum()
+    }
+    
+    /// Canonical norm: ||x||_{σ,2}
+    /// 
+    /// **Paper Reference**: SALSAA Section 2.2, Requirement 1.4
+    /// 
+    /// **Formula**: ||x||²_{σ,2} = Trace(⟨x, x̄⟩)
+    /// where:
+    /// - σ: R → C^φ is the canonical embedding
+    /// - x̄ is the complex conjugate
+    /// - Trace is the trace function Trace_{K/Q}
+    /// 
+    /// **Implementation**:
+    /// For cyclotomic ring R = Z[X]/(X^φ + 1), the canonical norm
+    /// can be computed via the trace of the inner product with conjugate.
+    pub fn canonical_norm(&self) -> f64 {
+        // Compute ⟨x, x̄⟩
+        let inner_prod = self.inner_product_conjugate(self);
+        
+        // Take trace
+        let trace_val = inner_prod.trace();
+        
+        // ||x||²_{σ,2} = Trace(⟨x, x̄⟩)
+        // Return square root
+        let trace_f64 = trace_val.constant_term().to_canonical_u64() as f64;
+        trace_f64.sqrt()
+    }
+    
+    /// Trace function: Trace_{K/Q}(x)
+    /// 
+    /// **Paper Reference**: SALSAA Section 2.2, Requirement 1.6
+    /// 
+    /// **Formula**: Trace(x) = Σ_{i=0}^{φ-1} σ_i(x)
+    /// where σ_i are the φ embeddings of R into C.
+    /// 
+    /// **Simplified Implementation**:
+    /// For cyclotomic rings, Trace(x) = φ · x_0 (constant term)
+    /// This is a simplification; full implementation would compute all embeddings.
+    pub fn trace(&self) -> Self {
+        let d = self.coeffs.len();
+        let mut result = vec![F::zero(); d];
+        
+        // Simplified: Trace(x) ≈ d · x_0
+        // In full implementation, would sum over all Galois conjugates
+        result[0] = self.coeffs[0].mul(&F::from_u64(d as u64));
+        
+        Self { coeffs: result }
+    }
+    
+    /// Scalar multiplication by field element
+    /// 
+    /// **Formula**: (α · x)_i = α · x_i for all i
+    pub fn scalar_mul_field(&self, scalar: &F) -> Self {
+        let result = self.coeffs.iter()
+            .map(|c| c.mul(scalar))
+            .collect();
+        
+        Self { coeffs: result }
+    }
+    
+    /// Get degree (number of coefficients)
+    pub fn degree(&self) -> usize {
+        self.coeffs.len()
+    }
+    
+    /// Create zero ring element of given degree
+    pub fn zero(degree: usize) -> Self {
+        Self {
+            coeffs: vec![F::zero(); degree],
+        }
     }
 }
 

@@ -19,9 +19,11 @@ pub mod transcript;
 pub mod extractor;
 pub mod compliance;
 pub mod errors;
+pub mod builder;
 
 pub use types::*;
 pub use transcript::*;
 pub use extractor::*;
 pub use compliance::*;
 pub use errors::*;
+pub use builder::{PCDBuilder, PCDSystem, PCDConfig, DAGNode, DAGExecutor};

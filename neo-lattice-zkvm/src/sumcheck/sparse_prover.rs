@@ -1,333 +1,564 @@
-// Task 1.6: Sparse Sum-Check with Prefix-Suffix Algorithm
-// Handles massive sums where most terms are zero with O(T + N^{1/c}) complexity
+// Sparse Sum-Check Prover
+// Implements O(T) prover for T non-zero terms
+//
+// Paper Reference: "Sum-check Is All You Need" (2025-2041), Section 4.2 "Sparse Sum-check"
+//
+// This module implements a critical optimization for sum-check when the polynomial
+// being summed has sparse structure - i.e., most evaluations are zero.
+//
+// Key Idea:
+// Traditional sum-check prover processes all 2^n evaluations, even if most are zero.
+// Sparse sum-check only processes the T non-zero terms, achieving O(T) complexity
+// instead of O(2^n), which is exponentially better when T << 2^n.
+//
+// Mathematical Background:
+// Given a polynomial g(x) with only T non-zero evaluations out of 2^n total,
+// we want to prove: Σ_{x∈{0,1}^n} g(x) = C
+//
+// Instead of iterating over all 2^n points, we maintain a sparse representation:
+// - Store only the T non-zero terms as (index, value) pairs
+// - For each round, compute the round polynomial by iterating only over non-zero terms
+// - Update the sparse representation by evaluating at the challenge point
+//
+// Algorithm Overview:
+// 1. Initialize with sparse representation: {(x_i, g(x_i)) : g(x_i) ≠ 0}
+// 2. For each round j:
+//    a. Compute s_j(X) by summing over non-zero terms
+//    b. Receive challenge r_j
+//    c. Update sparse representation by binding variable j to r_j
+// 3. Return final evaluation
+//
+// Structured Sparsity:
+// When the polynomial has structured sparsity (e.g., block-sparse, low-rank),
+// we can use prefix-suffix algorithms for even better performance.
+//
+// Paper Reference: Section 4.2.1 "Prefix-Suffix Algorithm"
+//
+// For polynomials of the form g(x,y) = p(x)·q(y), we can compute round polynomials
+// in O(√T) time using:
+// s_j(X) = Σ_x p(x)·[Σ_y q(y) where x_j = X]
+//
+// This exploits the tensor product structure to avoid redundant computation.
 
-use crate::field::extension_framework::ExtensionFieldElement;
-use crate::sumcheck::{MultilinearPolynomial, UnivariatePolynomial};
-use std::fmt::Debug;
+use crate::field::Field;
+use crate::polynomial::MultilinearPolynomial;
+use std::collections::HashMap;
 
-/// Sparse sum-check prover for g(x) = p̃(x) · q̃(x) where p̃ has only T non-zero entries
-/// Achieves O(T + N^{1/c}) time and O(N^{1/c}) space
-pub struct SparseSumCheckProver<K: ExtensionFieldElement> {
-    /// Non-zero entries of p̃ with their indices
-    pub sparse_entries: Vec<(usize, K)>,
+/// Sparse term in a multilinear polynomial
+/// Represents a single non-zero evaluation point
+#[derive(Clone, Debug)]
+pub struct SparseTerm<F: Field> {
+    /// Binary index of the evaluation point
+    /// For n variables, this is a value in [0, 2^n)
+    pub index: usize,
     
-    /// Dense polynomial q̃ factored as q̃(i,j) = f̃(i) · h̃(j)
-    pub f_evals: Vec<K>,
-    pub h_evals: Vec<K>,
-    
-    /// Current stage (1 or 2)
-    pub stage: usize,
-    
-    /// Arrays for current stage
-    pub p_array: Vec<K>,
-    pub q_array: Vec<K>,
-    
-    /// Configuration parameter c (controls memory usage)
-    pub c: usize,
-    
-    /// Total number of variables
-    pub num_vars: usize,
-    
-    /// Challenges from stage 1
-    pub stage1_challenges: Vec<K>,
+    /// Value at this point: g(index) ≠ 0
+    pub value: F,
 }
 
-impl<K: ExtensionFieldElement> SparseSumCheckProver<K> {
-    /// Initialize with sparsity T and memory O(N^{1/c})
-    /// 
-    /// Algorithm:
-    /// - sparse_p: T non-zero entries of p̃
-    /// - f, h: factorization of q̃(i,j) = f̃(i) · h̃(j)
-    /// - c: controls memory (c=2 gives O(√N) memory)
-    pub fn new(
-        sparse_p: Vec<(usize, K)>,
-        f: Vec<K>,
-        h: Vec<K>,
-        c: usize,
-    ) -> Result<Self, String> {
-        if c == 0 {
-            return Err("c must be at least 1".to_string());
-        }
+impl<F: Field> SparseTerm<F> {
+    /// Create new sparse term
+    pub fn new(index: usize, value: F) -> Self {
+        Self { index, value }
+    }
+    
+    /// Get bit at position i in the binary representation
+    /// Used to determine which "side" of a variable binding this term falls on
+    ///
+    /// Example: For index = 5 = 0b101:
+    /// - get_bit(0) = 1 (least significant bit)
+    /// - get_bit(1) = 0
+    /// - get_bit(2) = 1 (most significant bit)
+    pub fn get_bit(&self, position: usize) -> bool {
+        (self.index >> position) & 1 == 1
+    }
+    
+    /// Update index after binding variable at position
+    /// When we bind variable i to a challenge, we need to update the index
+    /// by removing bit i and shifting higher bits down
+    ///
+    /// Paper Reference: Section 4.2, "Index Update"
+    ///
+    /// Example: If we bind variable 1 in index 0b1011 (11):
+    /// - Bits 0 and 2-3 remain: 0b1_1 → 0b101 (5)
+    pub fn update_index(&mut self, bound_position: usize) {
+        // Extract bits below bound_position
+        let lower_mask = (1 << bound_position) - 1;
+        let lower_bits = self.index & lower_mask;
         
-        let sqrt_n = f.len();
-        if sqrt_n != h.len() {
-            return Err("f and h must have same length".to_string());
-        }
+        // Extract bits above bound_position and shift down
+        let upper_bits = (self.index >> (bound_position + 1)) << bound_position;
         
-        let num_vars = (sqrt_n * sqrt_n) as f64;
-        let num_vars = (num_vars.log2()) as usize;
-        
-        // Stage 1 initialization: one streaming pass over non-zero terms
-        let mut p_array = vec![K::zero(); sqrt_n];
-        
-        for &(idx, val) in &sparse_p {
-            let (i, j) = Self::split_index(idx, sqrt_n);
-            // P[i] = Σ_j p̃(i,j) · h̃(j)
-            if i < sqrt_n && j < sqrt_n {
-                p_array[i] = p_array[i].add(&val.mul(&h[j]));
-            }
-        }
-        
-        Ok(Self {
-            sparse_entries: sparse_p,
-            f_evals: f.clone(),
-            h_evals: h,
-            stage: 1,
-            p_array,
-            q_array: f, // Q[i] = f̃(i)
-            c,
+        // Combine
+        self.index = upper_bits | lower_bits;
+    }
+}
+
+/// Sparse sum-check prover
+///
+/// Paper Reference: "Sum-check Is All You Need", Section 4.2
+///
+/// Maintains a sparse representation of the polynomial and processes
+/// only non-zero terms in each round.
+pub struct SparseSumCheckProver<F: Field> {
+    /// Current sparse terms (only non-zero evaluations)
+    terms: Vec<SparseTerm<F>>,
+    
+    /// Number of variables in the original polynomial
+    num_vars: usize,
+    
+    /// Current round (0-indexed)
+    current_round: usize,
+    
+    /// Degree of the polynomial (typically 2 for products)
+    degree: usize,
+}
+
+impl<F: Field> SparseSumCheckProver<F> {
+    /// Create sparse sum-check prover from sparse representation
+    ///
+    /// Paper Reference: Section 4.2, "Sparse Representation"
+    ///
+    /// # Arguments
+    /// * `terms` - Non-zero terms as (index, value) pairs
+    /// * `num_vars` - Number of variables in the polynomial
+    /// * `degree` - Maximum degree of the polynomial
+    ///
+    /// # Returns
+    /// Prover that processes only T non-zero terms per round
+    pub fn new(terms: Vec<SparseTerm<F>>, num_vars: usize, degree: usize) -> Self {
+        Self {
+            terms,
             num_vars,
-            stage1_challenges: Vec::new(),
-        })
-    }
-    
-    /// Split index into (i, j) for prefix-suffix decomposition
-    fn split_index(idx: usize, sqrt_n: usize) -> (usize, usize) {
-        let i = idx / sqrt_n;
-        let j = idx % sqrt_n;
-        (i, j)
-    }
-    
-    /// Compute round polynomial for current stage
-    pub fn round_polynomial(&self) -> UnivariatePolynomial<K> {
-        let half = self.p_array.len() / 2;
-        
-        let mut s_0 = K::zero();
-        let mut s_1 = K::zero();
-        let mut s_2 = K::zero();
-        
-        for i in 0..half {
-            let p_0 = self.p_array[i];
-            let p_1 = self.p_array[i + half];
-            let q_0 = self.q_array[i];
-            let q_1 = self.q_array[i + half];
-            
-            s_0 = s_0.add(&p_0.mul(&q_0));
-            s_1 = s_1.add(&p_1.mul(&q_1));
-            
-            // Extrapolate to X=2
-            let two = K::from_base_field_element(K::BaseField::from_u64(2), 0);
-            let p_2 = two.mul(&p_1).sub(&p_0);
-            let q_2 = two.mul(&q_1).sub(&q_0);
-            s_2 = s_2.add(&p_2.mul(&q_2));
+            current_round: 0,
+            degree,
         }
-        
-        UnivariatePolynomial::from_evaluations(&[s_0, s_1, s_2])
     }
     
-    /// Update state after receiving challenge
-    pub fn update(&mut self, challenge: K) -> Result<(), String> {
-        let half = self.p_array.len() / 2;
-        let mut new_p = Vec::with_capacity(half);
-        let mut new_q = Vec::with_capacity(half);
+    /// Create from dense polynomial by extracting non-zero terms
+    ///
+    /// This is useful when you have a dense representation but know
+    /// the polynomial is sparse. The conversion is O(2^n) but only
+    /// done once at setup.
+    pub fn from_dense(poly: &MultilinearPolynomial<F>, degree: usize) -> Self {
+        let mut terms = Vec::new();
         
-        let one_minus_r = K::one().sub(&challenge);
-        
-        for i in 0..half {
-            let p_new = one_minus_r.mul(&self.p_array[i])
-                .add(&challenge.mul(&self.p_array[i + half]));
-            new_p.push(p_new);
-            
-            let q_new = one_minus_r.mul(&self.q_array[i])
-                .add(&challenge.mul(&self.q_array[i + half]));
-            new_q.push(q_new);
-        }
-        
-        self.p_array = new_p;
-        self.q_array = new_q;
-        
-        // Check if we need to transition to stage 2
-        if self.stage == 1 && self.p_array.len() == 1 {
-            self.stage1_challenges.push(challenge);
-            self.transition_to_stage2()?;
-        } else if self.stage == 1 {
-            self.stage1_challenges.push(challenge);
-        }
-        
-        Ok(())
-    }
-    
-    /// Transition from stage 1 to stage 2
-    /// After receiving challenges ⃗r from first n/2 rounds
-    fn transition_to_stage2(&mut self) -> Result<(), String> {
-        let sqrt_n = self.f_evals.len();
-        
-        // Create new P,Q arrays of size √N
-        let mut new_p = vec![K::zero(); sqrt_n];
-        let mut new_q = vec![K::zero(); sqrt_n];
-        
-        // For each sparse entry, compute P[j] = p̃(⃗r,j)
-        for &(idx, val) in &self.sparse_entries {
-            let (i, j) = Self::split_index(idx, sqrt_n);
-            
-            if j < sqrt_n {
-                // Evaluate p̃ at (⃗r, j) where ⃗r are stage 1 challenges
-                let p_at_r_j = self.eval_p_at_prefix(&self.stage1_challenges, i, val);
-                new_p[j] = new_p[j].add(&p_at_r_j);
+        for (index, value) in poly.evaluations().iter().enumerate() {
+            if value.to_canonical_u64() != 0 {
+                terms.push(SparseTerm::new(index, *value));
             }
         }
         
-        // Q[j] = f̃(⃗r) · h̃(j)
-        let f_at_r = self.eval_mle_at_point(&self.f_evals, &self.stage1_challenges);
-        for j in 0..sqrt_n {
-            new_q[j] = f_at_r.mul(&self.h_evals[j]);
-        }
-        
-        self.p_array = new_p;
-        self.q_array = new_q;
-        self.stage = 2;
-        
-        Ok(())
+        Self::new(terms, poly.num_vars(), degree)
     }
     
-    /// Evaluate p̃ at prefix challenges
-    fn eval_p_at_prefix(&self, challenges: &[K], i: usize, val: K) -> K {
-        // Convert i to bits and evaluate
-        let num_bits = challenges.len();
-        let mut result = val;
+    /// Compute round polynomial s_j(X)
+    ///
+    /// Paper Reference: Section 4.2, Algorithm 4.1
+    ///
+    /// For round j, we compute:
+    /// s_j(X) = Σ_{x'∈{0,1}^{n-j}} g(r_1,...,r_{j-1}, X, x')
+    ///
+    /// Key Optimization:
+    /// We only sum over the T non-zero terms, not all 2^{n-j} terms.
+    ///
+    /// Algorithm:
+    /// 1. Group terms by their bit at position j
+    /// 2. For X=0: sum terms where bit j = 0
+    /// 3. For X=1: sum terms where bit j = 1
+    /// 4. Interpolate to get polynomial of degree ≤ d
+    ///
+    /// Complexity: O(T) where T is number of non-zero terms
+    pub fn round_polynomial(&self) -> Vec<F> {
+        if self.terms.is_empty() {
+            return vec![F::zero(); self.degree + 1];
+        }
         
-        for (bit_idx, &challenge) in challenges.iter().enumerate() {
-            let bit = (i >> bit_idx) & 1;
-            let factor = if bit == 1 {
-                challenge
+        // Compute evaluations at X = 0, 1, ..., degree
+        let mut evaluations = vec![F::zero(); self.degree + 1];
+        
+        for eval_point in 0..=self.degree {
+            let mut sum = F::zero();
+            
+            for term in &self.terms {
+                // Determine contribution of this term to s_j(eval_point)
+                // This depends on the bit at position current_round
+                let bit = term.get_bit(self.current_round);
+                
+                // Compute the contribution using linear interpolation
+                // If bit = 0: contributes when X = 0
+                // If bit = 1: contributes when X = 1
+                // For general X: use (1-X)·term[bit=0] + X·term[bit=1]
+                
+                if eval_point == 0 && !bit {
+                    sum = sum.add(&term.value);
+                } else if eval_point == 1 && bit {
+                    sum = sum.add(&term.value);
+                } else if eval_point > 1 {
+                    // For higher degree evaluations, use extrapolation
+                    // This is needed when degree > 1 (e.g., for products)
+                    let contribution = if bit {
+                        // Term contributes at X=1, extrapolate to eval_point
+                        term.value.mul(&F::from_u64(eval_point as u64))
+                    } else {
+                        // Term contributes at X=0, no contribution for eval_point > 0
+                        F::zero()
+                    };
+                    sum = sum.add(&contribution);
+                }
+            }
+            
+            evaluations[eval_point] = sum;
+        }
+        
+        evaluations
+    }
+    
+    /// Update prover state with verifier challenge
+    ///
+    /// Paper Reference: Section 4.2, "Challenge Binding"
+    ///
+    /// After receiving challenge r_j, we:
+    /// 1. Evaluate each term at r_j: term' = (1-r_j)·term[bit=0] + r_j·term[bit=1]
+    /// 2. Update indices by removing bit j
+    /// 3. Remove any terms that become zero
+    ///
+    /// Key Property:
+    /// The number of non-zero terms can only decrease, maintaining sparsity.
+    ///
+    /// Complexity: O(T) where T is current number of non-zero terms
+    pub fn update(&mut self, challenge: F) -> Result<(), String> {
+        if self.current_round >= self.num_vars {
+            return Err("No more rounds remaining".to_string());
+        }
+        
+        let mut new_terms = Vec::new();
+        let one_minus_r = F::one().sub(&challenge);
+        
+        // Group terms by their index after removing the current bit
+        let mut grouped: HashMap<usize, F> = HashMap::new();
+        
+        for term in &self.terms {
+            let bit = term.get_bit(self.current_round);
+            
+            // Compute new value: (1-r)·value[bit=0] + r·value[bit=1]
+            let new_value = if bit {
+                challenge.mul(&term.value)
             } else {
-                K::one().sub(&challenge)
+                one_minus_r.mul(&term.value)
             };
-            result = result.mul(&factor);
+            
+            // Compute new index (remove current bit)
+            let mut new_term = SparseTerm::new(term.index, new_value);
+            new_term.update_index(self.current_round);
+            
+            // Accumulate terms with same new index
+            let entry = grouped.entry(new_term.index).or_insert(F::zero());
+            *entry = entry.add(&new_value);
         }
         
-        result
+        // Convert back to sparse terms, filtering zeros
+        for (index, value) in grouped {
+            if value.to_canonical_u64() != 0 {
+                new_terms.push(SparseTerm::new(index, value));
+            }
+        }
+        
+        self.terms = new_terms;
+        self.current_round += 1;
+        
+        Ok(())
     }
     
-    /// Evaluate MLE at point
-    fn eval_mle_at_point(&self, evals: &[K], point: &[K]) -> K {
-        let mut current = evals.to_vec();
+    /// Get final evaluation after all rounds
+    ///
+    /// After n rounds, we should have at most one non-zero term left,
+    /// which is the evaluation g(r_1, ..., r_n).
+    pub fn final_evaluation(&self) -> Result<F, String> {
+        if self.current_round != self.num_vars {
+            return Err(format!(
+                "Not all rounds complete: {}/{}",
+                self.current_round, self.num_vars
+            ));
+        }
         
-        for &r in point {
-            let half = current.len() / 2;
-            let mut next = Vec::with_capacity(half);
-            let one_minus_r = K::one().sub(&r);
+        // Sum all remaining terms (should be at most 1)
+        let mut sum = F::zero();
+        for term in &self.terms {
+            sum = sum.add(&term.value);
+        }
+        
+        Ok(sum)
+    }
+    
+    /// Get number of non-zero terms
+    ///
+    /// This is the key metric for sparse sum-check performance.
+    /// Prover work per round is O(T) where T is this value.
+    pub fn num_nonzero_terms(&self) -> usize {
+        self.terms.len()
+    }
+    
+    /// Check if prover is complete
+    pub fn is_complete(&self) -> bool {
+        self.current_round == self.num_vars
+    }
+}
+
+/// Prefix-Suffix Sparse Prover
+///
+/// Paper Reference: Section 4.2.1 "Prefix-Suffix Algorithm"
+///
+/// For polynomials with tensor product structure g(x,y) = p(x)·q(y),
+/// we can exploit this structure for even better performance.
+///
+/// Key Idea:
+/// Instead of storing all T = |supp(p)| × |supp(q)| non-zero terms,
+/// we store only the |supp(p)| + |supp(q)| non-zero terms of p and q.
+///
+/// Round Polynomial Computation:
+/// s_j(X) = [Σ_x p(x) where x_j = X] · [Σ_y q(y)]
+///
+/// This reduces work from O(T) to O(√T) when |supp(p)| ≈ |supp(q)| ≈ √T.
+pub struct PrefixSuffixProver<F: Field> {
+    /// Sparse terms for prefix polynomial p(x)
+    prefix_terms: Vec<SparseTerm<F>>,
+    
+    /// Sparse terms for suffix polynomial q(y)
+    suffix_terms: Vec<SparseTerm<F>>,
+    
+    /// Number of variables in prefix
+    prefix_vars: usize,
+    
+    /// Number of variables in suffix
+    suffix_vars: usize,
+    
+    /// Current round
+    current_round: usize,
+}
+
+impl<F: Field> PrefixSuffixProver<F> {
+    /// Create prefix-suffix prover
+    ///
+    /// Paper Reference: Section 4.2.1
+    ///
+    /// # Arguments
+    /// * `prefix_terms` - Non-zero terms of p(x)
+    /// * `suffix_terms` - Non-zero terms of q(y)
+    /// * `prefix_vars` - Number of variables in x
+    /// * `suffix_vars` - Number of variables in y
+    ///
+    /// # Complexity
+    /// Setup: O(|supp(p)| + |supp(q)|) instead of O(|supp(p)| × |supp(q)|)
+    pub fn new(
+        prefix_terms: Vec<SparseTerm<F>>,
+        suffix_terms: Vec<SparseTerm<F>>,
+        prefix_vars: usize,
+        suffix_vars: usize,
+    ) -> Self {
+        Self {
+            prefix_terms,
+            suffix_terms,
+            prefix_vars,
+            suffix_vars,
+            current_round: 0,
+        }
+    }
+    
+    /// Compute round polynomial using tensor structure
+    ///
+    /// Paper Reference: Section 4.2.1, Algorithm 4.2
+    ///
+    /// For round j:
+    /// - If j < prefix_vars: s_j(X) = [Σ_x p(x) where x_j = X] · [Σ_y q(y)]
+    /// - If j >= prefix_vars: s_j(X) = [Σ_x p(x)] · [Σ_y q(y) where y_{j-prefix_vars} = X]
+    ///
+    /// Complexity: O(|supp(p)| + |supp(q)|) instead of O(|supp(p)| × |supp(q)|)
+    pub fn round_polynomial(&self) -> Vec<F> {
+        let degree = 2; // For products
+        let mut evaluations = vec![F::zero(); degree + 1];
+        
+        if self.current_round < self.prefix_vars {
+            // Processing prefix variable
+            for eval_point in 0..=degree {
+                // Sum prefix terms where bit at current_round matches eval_point
+                let mut prefix_sum = F::zero();
+                for term in &self.prefix_terms {
+                    let bit = term.get_bit(self.current_round);
+                    if (eval_point == 0 && !bit) || (eval_point == 1 && bit) {
+                        prefix_sum = prefix_sum.add(&term.value);
+                    }
+                }
+                
+                // Sum all suffix terms (independent of current variable)
+                let mut suffix_sum = F::zero();
+                for term in &self.suffix_terms {
+                    suffix_sum = suffix_sum.add(&term.value);
+                }
+                
+                evaluations[eval_point] = prefix_sum.mul(&suffix_sum);
+            }
+        } else {
+            // Processing suffix variable
+            let suffix_round = self.current_round - self.prefix_vars;
             
-            for i in 0..half {
-                let val = one_minus_r.mul(&current[i])
-                    .add(&r.mul(&current[i + half]));
-                next.push(val);
+            for eval_point in 0..=degree {
+                // Sum all prefix terms (independent of current variable)
+                let mut prefix_sum = F::zero();
+                for term in &self.prefix_terms {
+                    prefix_sum = prefix_sum.add(&term.value);
+                }
+                
+                // Sum suffix terms where bit at suffix_round matches eval_point
+                let mut suffix_sum = F::zero();
+                for term in &self.suffix_terms {
+                    let bit = term.get_bit(suffix_round);
+                    if (eval_point == 0 && !bit) || (eval_point == 1 && bit) {
+                        suffix_sum = suffix_sum.add(&term.value);
+                    }
+                }
+                
+                evaluations[eval_point] = prefix_sum.mul(&suffix_sum);
+            }
+        }
+        
+        evaluations
+    }
+    
+    /// Update with challenge
+    ///
+    /// Updates either prefix or suffix terms depending on current round.
+    pub fn update(&mut self, challenge: F) -> Result<(), String> {
+        let total_vars = self.prefix_vars + self.suffix_vars;
+        if self.current_round >= total_vars {
+            return Err("No more rounds remaining".to_string());
+        }
+        
+        let one_minus_r = F::one().sub(&challenge);
+        
+        if self.current_round < self.prefix_vars {
+            // Update prefix terms
+            let mut new_prefix = Vec::new();
+            let mut grouped: HashMap<usize, F> = HashMap::new();
+            
+            for term in &self.prefix_terms {
+                let bit = term.get_bit(self.current_round);
+                let new_value = if bit {
+                    challenge.mul(&term.value)
+                } else {
+                    one_minus_r.mul(&term.value)
+                };
+                
+                let mut new_term = SparseTerm::new(term.index, new_value);
+                new_term.update_index(self.current_round);
+                
+                let entry = grouped.entry(new_term.index).or_insert(F::zero());
+                *entry = entry.add(&new_value);
             }
             
-            current = next;
+            for (index, value) in grouped {
+                if value.to_canonical_u64() != 0 {
+                    new_prefix.push(SparseTerm::new(index, value));
+                }
+            }
+            
+            self.prefix_terms = new_prefix;
+        } else {
+            // Update suffix terms
+            let suffix_round = self.current_round - self.prefix_vars;
+            let mut new_suffix = Vec::new();
+            let mut grouped: HashMap<usize, F> = HashMap::new();
+            
+            for term in &self.suffix_terms {
+                let bit = term.get_bit(suffix_round);
+                let new_value = if bit {
+                    challenge.mul(&term.value)
+                } else {
+                    one_minus_r.mul(&term.value)
+                };
+                
+                let mut new_term = SparseTerm::new(term.index, new_value);
+                new_term.update_index(suffix_round);
+                
+                let entry = grouped.entry(new_term.index).or_insert(F::zero());
+                *entry = entry.add(&new_value);
+            }
+            
+            for (index, value) in grouped {
+                if value.to_canonical_u64() != 0 {
+                    new_suffix.push(SparseTerm::new(index, value));
+                }
+            }
+            
+            self.suffix_terms = new_suffix;
         }
         
-        if current.is_empty() {
-            K::zero()
-        } else {
-            current[0]
-        }
+        self.current_round += 1;
+        Ok(())
     }
     
     /// Get final evaluation
-    pub fn final_evaluation(&self) -> Result<K, String> {
-        if self.p_array.len() != 1 || self.q_array.len() != 1 {
-            return Err("Not at final evaluation".to_string());
+    pub fn final_evaluation(&self) -> Result<F, String> {
+        let total_vars = self.prefix_vars + self.suffix_vars;
+        if self.current_round != total_vars {
+            return Err("Not all rounds complete".to_string());
         }
         
-        Ok(self.p_array[0].mul(&self.q_array[0]))
+        // Final value is product of remaining prefix and suffix sums
+        let mut prefix_sum = F::zero();
+        for term in &self.prefix_terms {
+            prefix_sum = prefix_sum.add(&term.value);
+        }
+        
+        let mut suffix_sum = F::zero();
+        for term in &self.suffix_terms {
+            suffix_sum = suffix_sum.add(&term.value);
+        }
+        
+        Ok(prefix_sum.mul(&suffix_sum))
     }
     
-    /// Verify total time is O(T + √N) for c=2
-    pub fn verify_complexity(&self, t: usize, n: usize, c: usize) -> bool {
-        let n_to_1_over_c = (n as f64).powf(1.0 / c as f64) as usize;
-        
-        // Initialization: O(T) to process sparse entries
-        let init_cost = t;
-        
-        // Stage 1: O(√N) for n/2 rounds
-        let stage1_cost = n_to_1_over_c * (n / c);
-        
-        // Stage 2: O(√N) for n/2 rounds
-        let stage2_cost = n_to_1_over_c * (n / c);
-        
-        let total_cost = init_cost + stage1_cost + stage2_cost;
-        let expected_cost = t + 2 * n_to_1_over_c;
-        
-        total_cost <= expected_cost * 2 // Allow 2x slack
+    /// Get total number of stored terms
+    ///
+    /// This is |supp(p)| + |supp(q)|, which is much smaller than
+    /// |supp(p)| × |supp(q)| when both are sparse.
+    pub fn num_stored_terms(&self) -> usize {
+        self.prefix_terms.len() + self.suffix_terms.len()
     }
 }
 
-/// Generalized sparse sum-check for arbitrary c
-/// Achieves O(T + N^{1/c}) time and space
-pub struct GeneralizedSparseSumCheck<K: ExtensionFieldElement> {
-    /// Sparsity T
-    pub sparsity: usize,
+/// Sparse sum-check proof
+#[derive(Clone, Debug)]
+pub struct SparseSumCheckProof<F: Field> {
+    /// Round polynomials (one per variable)
+    pub round_polynomials: Vec<Vec<F>>,
     
-    /// Total size N = 2^n
-    pub total_size: usize,
+    /// Final evaluation
+    pub final_evaluation: F,
     
-    /// Parameter c
-    pub c: usize,
-    
-    /// Current stage (1 to c)
-    pub current_stage: usize,
-    
-    /// Sparse entries
-    pub sparse_entries: Vec<(usize, K)>,
-    
-    /// Stage arrays
-    pub stage_arrays: Vec<Vec<K>>,
-    
-    /// Challenges from previous stages
-    pub all_challenges: Vec<Vec<K>>,
+    /// Claimed sum
+    pub claimed_sum: F,
 }
 
-impl<K: ExtensionFieldElement> GeneralizedSparseSumCheck<K> {
-    /// Initialize for arbitrary c
+impl<F: Field> SparseSumCheckProof<F> {
+    /// Create new sparse proof
     pub fn new(
-        sparse_entries: Vec<(usize, K)>,
-        total_size: usize,
-        c: usize,
-    ) -> Result<Self, String> {
-        if c == 0 {
-            return Err("c must be at least 1".to_string());
+        round_polynomials: Vec<Vec<F>>,
+        final_evaluation: F,
+        claimed_sum: F,
+    ) -> Self {
+        Self {
+            round_polynomials,
+            final_evaluation,
+            claimed_sum,
         }
-        
-        let chunk_size = (total_size as f64).powf(1.0 / c as f64) as usize;
-        
-        Ok(Self {
-            sparsity: sparse_entries.len(),
-            total_size,
-            c,
-            current_stage: 1,
-            sparse_entries,
-            stage_arrays: vec![vec![K::zero(); chunk_size]],
-            all_challenges: Vec::new(),
-        })
     }
     
-    /// Process stage
-    pub fn process_stage(&mut self, challenges: Vec<K>) -> Result<(), String> {
-        self.all_challenges.push(challenges);
-        self.current_stage += 1;
-        
-        if self.current_stage <= self.c {
-            // Initialize next stage
-            let chunk_size = (self.total_size as f64).powf(1.0 / self.c as f64) as usize;
-            self.stage_arrays.push(vec![K::zero(); chunk_size]);
-        }
-        
-        Ok(())
-    }
-    
-    /// Verify complexity: O(C·T) for K = T^C
-    pub fn verify_optimal_complexity(&self) -> bool {
-        // For K = T^C, prover time should be O(C·T)
-        let k = self.total_size;
-        let t = self.sparsity;
-        let c = self.c;
-        
-        // Check if K ≈ T^C
-        let expected_k = (t as f64).powi(c as i32) as usize;
-        let ratio = k as f64 / expected_k as f64;
-        
-        // Allow 2x slack
-        ratio >= 0.5 && ratio <= 2.0
+    /// Get proof size in field elements
+    pub fn size_in_field_elements(&self) -> usize {
+        let round_poly_size: usize = self.round_polynomials.iter()
+            .map(|poly| poly.len())
+            .sum();
+        round_poly_size + 2 // +2 for final_evaluation and claimed_sum
     }
 }

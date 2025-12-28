@@ -366,3 +366,245 @@ mod tests {
         assert_eq!(challenges.len(), 2);
     }
 }
+
+
+/// SALSAA-specific sum-check verifier
+/// 
+/// **Paper Reference**: SALSAA Section 3, Requirements 4.2, 4.3
+/// 
+/// **Key Properties**:
+/// - Verifier complexity: O(μ·d) field operations
+/// - Communication: (2d-1)·μ field elements
+/// - Soundness error: ≤ 2μd/|F| by Schwartz-Zippel lemma
+/// 
+/// **Mathematical Background**:
+/// The verifier checks that:
+/// 1. Round 1: C = g_1(0) + g_1(1)
+/// 2. Round i: g_{i-1}(r_{i-1}) = g_i(0) + g_i(1) for i ∈ [2,μ]
+/// 3. Final: g_μ(r_μ) = g(r_1,...,r_μ) where g is the claimed polynomial
+/// 
+/// **Why O(μ·d) Complexity**:
+/// - μ rounds total
+/// - Each round: verify polynomial of degree ≤ 2(d-1)
+/// - Verification per round: O(d) operations (evaluate polynomial)
+/// - Total: O(μ·d) operations
+#[derive(Clone, Debug)]
+pub struct SALSAASumCheckVerifier<K: ExtensionFieldElement> {
+    /// Underlying dense verifier
+    verifier: DenseSumCheckVerifier<K>,
+    /// Degree bound per variable (d)
+    degree_bound: usize,
+    /// Number of variables (μ)
+    num_vars: usize,
+}
+
+impl<K: ExtensionFieldElement> SALSAASumCheckVerifier<K> {
+    /// Create SALSAA sum-check verifier
+    /// 
+    /// **Paper Reference**: SALSAA Section 3.1, Requirement 4.2
+    /// 
+    /// **Input**:
+    /// - claimed_sum: Target sum C
+    /// - num_vars: Number of variables μ
+    /// - degree_bound: Maximum degree per variable d
+    /// 
+    /// **Output**:
+    /// Verifier that checks proofs in O(μ·d) time
+    pub fn new(
+        claimed_sum: K,
+        num_vars: usize,
+        degree_bound: usize,
+    ) -> Self {
+        let verifier = DenseSumCheckVerifier::new(claimed_sum, num_vars);
+        
+        Self {
+            verifier,
+            degree_bound,
+            num_vars,
+        }
+    }
+    
+    /// Verify round polynomial g_j(X) with degree ≤ 2(d-1)
+    /// 
+    /// **Paper Reference**: SALSAA Section 3.1, Requirement 4.2
+    /// 
+    /// **Checks**:
+    /// 1. Degree bound: deg(g_j) ≤ 2(d-1)
+    /// 2. Consistency: g_{j-1}(r_{j-1}) = g_j(0) + g_j(1)
+    /// 
+    /// **Complexity**: O(d) field operations
+    /// - Evaluate g_j at 0, 1, and r_{j-1}: O(d) each
+    /// - Total: O(d) operations
+    pub fn verify_round_salsaa(
+        &mut self,
+        round_poly: UnivariatePolynomial<K>,
+    ) -> VerificationResult {
+        // Check degree bound: deg(g_j) ≤ 2(d-1)
+        let max_degree = 2 * (self.degree_bound - 1);
+        if round_poly.degree() > max_degree {
+            return VerificationResult::Reject(format!(
+                "Round polynomial has degree {} > 2(d-1) = {}",
+                round_poly.degree(),
+                max_degree
+            ));
+        }
+        
+        // Use underlying verifier for consistency checks
+        if self.verifier.round == 0 {
+            self.verifier.verify_round_1(round_poly)
+        } else {
+            self.verifier.verify_round_i(round_poly)
+        }
+    }
+    
+    /// Verify final evaluation check
+    /// 
+    /// **Paper Reference**: SALSAA Section 3.1, Requirement 4.3
+    /// 
+    /// **Check**: g_μ(r_μ) = LDE[W](r) ⊙ LDE[W̄](r̄)
+    /// 
+    /// This requires the verifier to evaluate the LDE at the random point,
+    /// which is done via oracle queries in the full protocol.
+    pub fn verify_final_salsaa(
+        &self,
+        final_poly: &UnivariatePolynomial<K>,
+        final_eval: K,
+    ) -> VerificationResult {
+        self.verifier.verify_final(final_poly, final_eval)
+    }
+    
+    /// Compute verifier complexity in field operations
+    /// 
+    /// **Paper Reference**: Requirement 4.3
+    /// 
+    /// **Formula**: O(μ·d) field operations + O(r) ring operations
+    /// where:
+    /// - μ = number of rounds
+    /// - d = degree bound per variable
+    /// - r = number of columns (for final evaluation)
+    /// 
+    /// **Breakdown**:
+    /// - Each round: Evaluate polynomial of degree 2(d-1) → O(d) ops
+    /// - μ rounds: O(μ·d) ops
+    /// - Final evaluation: O(r) ring operations
+    pub fn verifier_complexity_ops(&self, num_columns: usize) -> usize {
+        let round_ops = self.num_vars * self.degree_bound;
+        let final_ops = num_columns;
+        round_ops + final_ops
+    }
+    
+    /// Compute soundness error
+    /// 
+    /// **Paper Reference**: SALSAA Section 3.1
+    /// 
+    /// **Theorem**: Soundness error ≤ 2μ(d-1)/|F| by Schwartz-Zippel lemma
+    /// 
+    /// **Proof**:
+    /// - Each round polynomial has degree ≤ 2(d-1)
+    /// - By Schwartz-Zippel, probability of accepting bad polynomial ≤ 2(d-1)/|F|
+    /// - Union bound over μ rounds: ≤ 2μ(d-1)/|F|
+    pub fn soundness_error_salsaa(&self, field_size: u64) -> f64 {
+        let numerator = 2.0 * (self.num_vars as f64) * ((self.degree_bound - 1) as f64);
+        let denominator = field_size as f64;
+        numerator / denominator
+    }
+    
+    /// Get challenges sent to prover
+    pub fn get_challenges(&self) -> &[K] {
+        self.verifier.get_challenges()
+    }
+    
+    /// Check if verification is complete
+    pub fn is_complete(&self) -> bool {
+        self.verifier.is_complete()
+    }
+}
+
+/// LDE evaluation claim verifier
+/// 
+/// **Paper Reference**: SALSAA Section 3.2, Requirements 4.6, 4.8
+/// 
+/// **Purpose**: Verify that LDE[M_i·W](r_i) = s_i mod q for structured matrices M_i
+/// 
+/// **Structured Matrices**:
+/// - Diagonal matrices
+/// - Circulant matrices  
+/// - Toeplitz matrices
+/// - Other matrices with fast multiplication
+/// 
+/// **Why This Matters**:
+/// After sum-check, we're left with evaluation claims on the LDE.
+/// These must be verified using polynomial commitment schemes or
+/// additional sum-check reductions.
+#[derive(Clone, Debug)]
+pub struct LDEEvaluationVerifier<K: ExtensionFieldElement> {
+    /// Evaluation point r ∈ F^μ
+    pub evaluation_point: Vec<K>,
+    /// Claimed evaluation s ∈ R_q
+    pub claimed_value: Vec<K>,
+    /// Matrix structure type
+    pub matrix_type: MatrixStructure,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MatrixStructure {
+    Diagonal,
+    Circulant,
+    Toeplitz,
+    General,
+}
+
+impl<K: ExtensionFieldElement> LDEEvaluationVerifier<K> {
+    /// Create LDE evaluation verifier
+    /// 
+    /// **Paper Reference**: Requirement 4.8
+    pub fn new(
+        evaluation_point: Vec<K>,
+        claimed_value: Vec<K>,
+        matrix_type: MatrixStructure,
+    ) -> Self {
+        Self {
+            evaluation_point,
+            claimed_value,
+            matrix_type,
+        }
+    }
+    
+    /// Verify evaluation claim using polynomial commitment
+    /// 
+    /// **Paper Reference**: SALSAA Section 3.2
+    /// 
+    /// In the full protocol, this would:
+    /// 1. Query polynomial commitment at evaluation_point
+    /// 2. Verify opening proof
+    /// 3. Check that opened value matches claimed_value
+    /// 
+    /// For structured matrices, we can optimize the verification.
+    pub fn verify_with_commitment(
+        &self,
+        _commitment: &[u8], // Placeholder for actual commitment type
+        _opening_proof: &[u8], // Placeholder for actual proof type
+    ) -> VerificationResult {
+        // In full implementation, verify polynomial commitment opening
+        // For now, return accept as placeholder
+        VerificationResult::Accept
+    }
+    
+    /// Compute verification complexity for structured matrices
+    /// 
+    /// **Paper Reference**: Requirement 4.8
+    /// 
+    /// **Optimization**: For structured matrices, verification can be faster
+    /// - Diagonal: O(1) operations
+    /// - Circulant: O(log n) operations via FFT
+    /// - Toeplitz: O(log n) operations
+    /// - General: O(n) operations
+    pub fn verification_complexity(&self, matrix_size: usize) -> usize {
+        match self.matrix_type {
+            MatrixStructure::Diagonal => 1,
+            MatrixStructure::Circulant => (matrix_size as f64).log2() as usize,
+            MatrixStructure::Toeplitz => (matrix_size as f64).log2() as usize,
+            MatrixStructure::General => matrix_size,
+        }
+    }
+}

@@ -400,3 +400,216 @@ mod tests {
         assert_eq!(proof.size_in_field_elements(), 8);
     }
 }
+
+
+/// SALSAA-specific sum-check prover for norm verification
+/// 
+/// **Paper Reference**: SALSAA Section 3, Requirements 4.1, 4.7, 18.7, 21.12
+/// 
+/// **Key Innovation**: Linear-time prover using dynamic programming (Thaler's optimization)
+/// 
+/// **Mathematical Background**:
+/// SALSAA proves norm bounds via sum-check over the identity:
+/// ||x||²_{σ,2} = Trace(⟨x, x̄⟩) = Σ_{z∈[d]^μ} u^T·CRT(LDE[W](z) ⊙ LDE[W̄](z̄))
+/// 
+/// where:
+/// - W is the witness matrix
+/// - LDE[W] is the low-degree extension
+/// - W̄ is the complex conjugate
+/// - CRT is the Chinese Remainder Theorem decomposition
+/// - u is a random linear combination vector
+/// 
+/// **Prover Complexity**: O(m) where m = d^μ is the number of evaluations
+/// - Round 1: Process all m evaluations → O(m) work
+/// - Round 2: Process m/2 evaluations → O(m/2) work
+/// - Round i: Process m/2^{i-1} evaluations → O(m/2^{i-1}) work
+/// - Total: O(m + m/2 + m/4 + ... + 1) = O(2m) = O(m)
+/// 
+/// **Why This Matters**:
+/// Traditional sum-check has O(m·μ) prover time. Thaler's optimization achieves O(m),
+/// which is optimal since the prover must read all m evaluations at least once.
+#[derive(Clone, Debug)]
+pub struct SALSAASumCheckProver<K: ExtensionFieldElement> {
+    /// Underlying dense prover
+    prover: DenseSumCheckProver<K>,
+    /// Degree bound per variable (d)
+    degree_bound: usize,
+    /// Number of variables (μ)
+    num_vars: usize,
+}
+
+impl<K: ExtensionFieldElement> SALSAASumCheckProver<K> {
+    /// Create SALSAA sum-check prover
+    /// 
+    /// **Paper Reference**: SALSAA Section 3.1, Requirement 4.1
+    /// 
+    /// **Input**:
+    /// - lde_w: Low-degree extension of witness W
+    /// - lde_w_bar: Low-degree extension of conjugate W̄
+    /// - degree_bound: Maximum degree per variable (typically d-1)
+    /// 
+    /// **Output**:
+    /// Prover that can generate round polynomials in O(m) total time
+    pub fn new(
+        lde_w: MultilinearPolynomial<K>,
+        lde_w_bar: MultilinearPolynomial<K>,
+        degree_bound: usize,
+    ) -> Result<Self, String> {
+        let num_vars = lde_w.num_vars;
+        let prover = DenseSumCheckProver::new(lde_w, lde_w_bar)?;
+        
+        Ok(Self {
+            prover,
+            degree_bound,
+            num_vars,
+        })
+    }
+    
+    /// Compute round polynomial g_j(X) with degree ≤ 2(d-1)
+    /// 
+    /// **Paper Reference**: SALSAA Section 3.1, Requirement 4.2
+    /// 
+    /// **Mathematical Formula**:
+    /// g_j(X) = Σ_{x'∈[d]^{μ-j}} LDE[W](r_1,...,r_{j-1},X,x') ⊙ LDE[W̄](r_1,...,r_{j-1},X,x')
+    /// 
+    /// **Degree Analysis**:
+    /// - Each LDE[W](·,X,·) has degree ≤ d-1 in X
+    /// - Product has degree ≤ 2(d-1)
+    /// - Requires (2d-1) field elements to represent
+    /// 
+    /// **Optimization**:
+    /// Uses dynamic programming to compute in O(m/2^j) time for round j
+    pub fn round_polynomial_salsaa(&self) -> UnivariatePolynomial<K> {
+        // Use underlying dense prover's optimized implementation
+        self.prover.round_polynomial()
+    }
+    
+    /// Update prover state with verifier challenge
+    /// 
+    /// **Paper Reference**: SALSAA Section 3.1
+    /// 
+    /// **Work Halving**:
+    /// After binding variable j to challenge r_j, the remaining problem
+    /// has size m/2. This is the key to O(m) total time.
+    pub fn update_salsaa(&mut self, challenge: K) -> Result<(), String> {
+        self.prover.update(challenge)
+    }
+    
+    /// Verify linear-time complexity
+    /// 
+    /// **Paper Reference**: Requirement 18.7
+    /// 
+    /// **Theorem**: Total prover work is O(m) field operations where m = d^μ
+    /// 
+    /// **Proof**:
+    /// Work in round j = O(m/2^{j-1})
+    /// Total = Σ_{j=1}^μ O(m/2^{j-1}) = O(m·Σ_{j=0}^{μ-1} 1/2^j) = O(m·2) = O(m)
+    pub fn verify_linear_time_complexity(&self) -> bool {
+        self.prover.verify_linear_time(self.num_vars)
+    }
+    
+    /// Get communication complexity in bits
+    /// 
+    /// **Paper Reference**: SALSAA Section 3.1, Requirement 4.5
+    /// 
+    /// **Formula**: (2d-1)·μ·e·log q + 2r·log|R_q| bits
+    /// where:
+    /// - (2d-1) = coefficients per round polynomial
+    /// - μ = number of rounds
+    /// - e = splitting degree (from CRT decomposition)
+    /// - log q = field element size
+    /// - r = number of columns in witness matrix
+    /// - log|R_q| = ring element size
+    pub fn communication_complexity_bits(
+        &self,
+        splitting_degree: usize,
+        log_q: usize,
+        num_columns: usize,
+        log_ring_size: usize,
+    ) -> usize {
+        let round_poly_bits = (2 * self.degree_bound - 1) * self.num_vars * splitting_degree * log_q;
+        let final_eval_bits = 2 * num_columns * log_ring_size;
+        round_poly_bits + final_eval_bits
+    }
+}
+
+/// Batched norm check via random linear combination
+/// 
+/// **Paper Reference**: SALSAA Section 3.2, Requirement 4.4
+/// 
+/// **Problem**: Need to verify r norm bounds: ||W_i||² ≤ ν_i for i ∈ [r]
+/// 
+/// **Solution**: Use random linear combination to reduce to single sum-check
+/// - Verifier sends random u ∈ F^r
+/// - Prover proves: Σ_i u_i·||W_i||² ≤ Σ_i u_i·ν_i
+/// - By Schwartz-Zippel, if this holds, all individual bounds hold with high probability
+/// 
+/// **Benefit**: r sum-checks → 1 sum-check, reducing communication by factor of r
+#[derive(Clone, Debug)]
+pub struct BatchedNormCheck<K: ExtensionFieldElement> {
+    /// Number of columns to batch
+    num_columns: usize,
+    /// Random linear combination coefficients
+    rlc_coefficients: Vec<K>,
+    /// Individual norm bounds
+    norm_bounds: Vec<f64>,
+}
+
+impl<K: ExtensionFieldElement> BatchedNormCheck<K> {
+    /// Create batched norm check
+    /// 
+    /// **Paper Reference**: Requirement 4.4
+    /// 
+    /// **Input**:
+    /// - num_columns: Number of norm bounds to batch (r)
+    /// - rlc_coefficients: Random challenges u ∈ F^r from verifier
+    /// - norm_bounds: Individual bounds ν_i
+    pub fn new(
+        num_columns: usize,
+        rlc_coefficients: Vec<K>,
+        norm_bounds: Vec<f64>,
+    ) -> Result<Self, String> {
+        if rlc_coefficients.len() != num_columns {
+            return Err("RLC coefficients must match number of columns".to_string());
+        }
+        if norm_bounds.len() != num_columns {
+            return Err("Norm bounds must match number of columns".to_string());
+        }
+        
+        Ok(Self {
+            num_columns,
+            rlc_coefficients,
+            norm_bounds,
+        })
+    }
+    
+    /// Compute batched target sum
+    /// 
+    /// **Formula**: t = Σ_i u_i·ν_i
+    /// 
+    /// This is the right-hand side of the batched inequality.
+    pub fn compute_batched_target(&self) -> f64 {
+        self.rlc_coefficients.iter()
+            .zip(self.norm_bounds.iter())
+            .map(|(u, nu)| {
+                // Convert u to f64 (using constant term if it's a ring element)
+                let u_val = u.to_base_field_element().to_canonical_u64() as f64;
+                u_val * nu
+            })
+            .sum()
+    }
+    
+    /// Verify soundness of batching
+    /// 
+    /// **Paper Reference**: Requirement 4.4
+    /// 
+    /// **Theorem**: If Σ_i u_i·||W_i||² ≤ Σ_i u_i·ν_i for random u,
+    /// then ||W_i||² ≤ ν_i for all i with probability ≥ 1 - r/|F|
+    /// 
+    /// **Proof**: By Schwartz-Zippel lemma on the polynomial
+    /// p(u) = Σ_i u_i·(||W_i||² - ν_i)
+    pub fn verify_soundness(&self, field_size: u64) -> f64 {
+        // Soundness error = r/|F|
+        (self.num_columns as f64) / (field_size as f64)
+    }
+}
