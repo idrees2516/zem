@@ -1,4 +1,5 @@
 *.pdf
+pdf's folder/
 target/
 Cargo.lock
 
