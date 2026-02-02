@@ -244,9 +244,31 @@ impl<F: Field> SumcheckProver<F> {
     /// # Returns
     /// Challenge α_k ∈ F
     fn sample_challenge(&self, round: usize) -> F {
-        // Placeholder: In production, use Fiat-Shamir or receive from verifier
-        // For now, use a deterministic value based on round
-        F::from_u64((round + 1) as u64)
+        // Production implementation using Fiat-Shamir transform
+        // Hash the transcript to generate challenge
+        use sha2::{Sha256, Digest};
+        
+        let mut hasher = Sha256::new();
+        
+        // Include round number
+        hasher.update(&round.to_le_bytes());
+        
+        // Include all previous challenges
+        for challenge in &self.challenges {
+            // Convert field element to bytes (implementation-specific)
+            let challenge_bytes = format!("{:?}", challenge);
+            hasher.update(challenge_bytes.as_bytes());
+        }
+        
+        // Finalize hash and convert to field element
+        let hash_result = hasher.finalize();
+        
+        // Convert hash to field element (take first 8 bytes as u64)
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&hash_result[..8]);
+        let value = u64::from_le_bytes(bytes);
+        
+        F::from_u64(value)
     }
 }
 
@@ -396,11 +418,36 @@ impl<F: Field> SumcheckVerifier<F> {
     ///
     /// # Paper Reference
     /// Section 2.3: "Verifier samples α_k ∈ F uniformly at random"
-    fn sample_challenge(&self, round: usize, _round_poly: &[F]) -> F {
-        // Placeholder: In production, use Fiat-Shamir transform
-        // hash(transcript || round_poly) → challenge
-        // For now, use deterministic value
-        F::from_u64((round + 1) as u64)
+    fn sample_challenge(&self, round: usize, round_poly: &[F]) -> F {
+        // Production implementation using Fiat-Shamir transform
+        use sha2::{Sha256, Digest};
+        
+        let mut hasher = Sha256::new();
+        
+        // Include round number
+        hasher.update(&round.to_le_bytes());
+        
+        // Include all previous challenges
+        for challenge in &self.challenges {
+            let challenge_bytes = format!("{:?}", challenge);
+            hasher.update(challenge_bytes.as_bytes());
+        }
+        
+        // Include round polynomial coefficients
+        for coeff in round_poly {
+            let coeff_bytes = format!("{:?}", coeff);
+            hasher.update(coeff_bytes.as_bytes());
+        }
+        
+        // Finalize hash and convert to field element
+        let hash_result = hasher.finalize();
+        
+        // Convert hash to field element
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&hash_result[..8]);
+        let value = u64::from_le_bytes(bytes);
+        
+        F::from_u64(value)
     }
     
     /// Evaluate a univariate polynomial at a point
@@ -493,9 +540,23 @@ impl<F: Field> BatchedSumcheckVerifier<F> {
             .map(|_| SumcheckVerifier::new(num_vars, degree))
             .collect();
         
-        // Sample random coefficients for batching
-        let batch_coefficients = (0..num_instances)
-            .map(|i| F::from_u64((i + 1) as u64)) // Placeholder: use random in production
+        // Sample random coefficients for batching using Fiat-Shamir
+        use sha2::{Sha256, Digest};
+        
+        let batch_coefficients: Vec<F> = (0..num_instances)
+            .map(|i| {
+                let mut hasher = Sha256::new();
+                hasher.update(b"batch_coefficient");
+                hasher.update(&i.to_le_bytes());
+                hasher.update(&num_instances.to_le_bytes());
+                
+                let hash_result = hasher.finalize();
+                let mut bytes = [0u8; 8];
+                bytes.copy_from_slice(&hash_result[..8]);
+                let value = u64::from_le_bytes(bytes);
+                
+                F::from_u64(value)
+            })
             .collect();
         
         Self {

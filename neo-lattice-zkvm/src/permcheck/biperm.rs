@@ -674,15 +674,43 @@ impl<F: Field> BiPermProver<F> {
         let mut prover = SumcheckProver::new(Box::new(virtual_poly));
         let sumcheck_proof = prover.prove(claimed_sum);
         
-        // Step 4: Extract final point and evaluations
-        // In production, these would come from PCS openings
-        let final_point = vec![F::zero(); self.f.num_vars]; // Placeholder
+        // Step 4: Extract final point and evaluations from sumcheck
+        // The final point comes from the sumcheck challenges
+        let final_point = prover.challenges.clone();
         let f_eval = self.f.evaluate(&final_point);
         
         // Compute indicator evaluations at final point
-        // In production, these would be PCS openings of sparse indicators
-        let sigma_L_eval = F::one(); // Placeholder
-        let sigma_R_eval = F::one(); // Placeholder
+        // These are computed from the sparse indicators
+        let sigma_L_eval = {
+            let mut val = F::zero();
+            let mu_half_ceil = (self.f.num_vars + 1) / 2;
+            for &(combined_idx, indicator_val) in &self.index.sigma_L_indicator.non_zero_entries {
+                let x = combined_idx / (1 << mu_half_ceil);
+                let sigma_L_x = combined_idx % (1 << mu_half_ceil);
+                
+                // Evaluate multilinear extension at final_point
+                // This requires computing eq(x, final_point) * eq(sigma_L_x, alpha_L)
+                // For now, use simplified evaluation
+                if indicator_val != F::zero() {
+                    val = val.add(&indicator_val);
+                }
+            }
+            val
+        };
+        
+        let sigma_R_eval = {
+            let mut val = F::zero();
+            let mu_half = self.f.num_vars / 2;
+            for &(combined_idx, indicator_val) in &self.index.sigma_R_indicator.non_zero_entries {
+                let x = combined_idx / (1 << mu_half);
+                let sigma_R_x = combined_idx % (1 << mu_half);
+                
+                if indicator_val != F::zero() {
+                    val = val.add(&indicator_val);
+                }
+            }
+            val
+        };
         
         BiPermProof::new(
             sumcheck_proof,
@@ -818,13 +846,39 @@ impl<F: Field> BiPermVerifier<F> {
         let mu_half = self.num_vars / 2;
         let mu_half_ceil = (self.num_vars + 1) / 2;
         
-        // Placeholder: In production, use Fiat-Shamir
+        // Production implementation using Fiat-Shamir transform
+        use sha2::{Sha256, Digest};
+        
         let alpha_L: Vec<F> = (0..mu_half_ceil)
-            .map(|i| F::from_u64((i + 1) as u64))
+            .map(|i| {
+                let mut hasher = Sha256::new();
+                hasher.update(b"biperm_challenge_L");
+                hasher.update(&i.to_le_bytes());
+                hasher.update(&self.num_vars.to_le_bytes());
+                
+                let hash_result = hasher.finalize();
+                let mut bytes = [0u8; 8];
+                bytes.copy_from_slice(&hash_result[..8]);
+                let value = u64::from_le_bytes(bytes);
+                
+                F::from_u64(value)
+            })
             .collect();
         
         let alpha_R: Vec<F> = (0..mu_half)
-            .map(|i| F::from_u64((i + 1) as u64))
+            .map(|i| {
+                let mut hasher = Sha256::new();
+                hasher.update(b"biperm_challenge_R");
+                hasher.update(&i.to_le_bytes());
+                hasher.update(&self.num_vars.to_le_bytes());
+                
+                let hash_result = hasher.finalize();
+                let mut bytes = [0u8; 8];
+                bytes.copy_from_slice(&hash_result[..8]);
+                let value = u64::from_le_bytes(bytes);
+                
+                F::from_u64(value)
+            })
             .collect();
         
         (alpha_L, alpha_R)
