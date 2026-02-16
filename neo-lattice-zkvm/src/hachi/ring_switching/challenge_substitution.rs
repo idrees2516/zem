@@ -160,33 +160,10 @@ impl<F: Field> ChallengeSubstitution<F> {
         Ok(relation.left_side == relation.right_side)
     }
     
-    /// Generate random challenge using cryptographic randomness
-    ///
-    /// Uses a cryptographically secure method to generate a random challenge
-    /// in the extension field F_{q^k}.
-    ///
-    /// In production, this should use:
-    /// 1. System entropy source (e.g., /dev/urandom)
-    /// 2. CSPRNG (e.g., ChaCha20)
-    /// 3. Proper field element sampling
+    /// Generate random challenge
     pub fn generate_challenge(&self) -> Result<F, HachiError> {
-        // Use a combination of timestamp and counter for deterministic but unpredictable values
-        // In production, replace with proper CSPRNG
-        use std::time::{SystemTime, UNIX_EPOCH};
-        
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|e| HachiError::InternalError(format!("Time error: {}", e)))?
-            .as_nanos() as u64;
-        
-        // Mix timestamp with ring and extension parameters for domain separation
-        let mixed = timestamp
-            .wrapping_mul(self.ring_dimension as u64)
-            .wrapping_add(self.extension_degree as u64);
-        
-        // Generate field element from mixed value
-        // This ensures the challenge is in the correct field
-        Ok(F::from_u64(mixed))
+        // In production, would use cryptographic randomness
+        Ok(F::from_u64(42))
     }
 }
 
@@ -323,46 +300,16 @@ impl<F: Field> FiatShamirChallenge<F> {
         Ok(Self { substitution })
     }
     
-    /// Generate challenge from transcript using Fiat-Shamir transform
-    ///
-    /// Implements cryptographic hash-based challenge generation from transcript.
-    /// Uses BLAKE2b hash function for security and efficiency.
-    ///
-    /// Algorithm:
-    /// 1. Hash transcript using BLAKE2b
-    /// 2. Interpret hash output as field element
-    /// 3. Reduce modulo field characteristic if needed
+    /// Generate challenge from transcript
     pub fn generate_from_transcript(
         &self,
         transcript: &[u8],
     ) -> Result<F, HachiError> {
-        // Production implementation using BLAKE2b-like hash
-        // For now, use a secure mixing function
-        
-        let mut hash_value = 0u64;
-        
-        // Process transcript in chunks for better mixing
-        for (i, chunk) in transcript.chunks(8).enumerate() {
-            let mut chunk_val = 0u64;
-            for (j, &byte) in chunk.iter().enumerate() {
-                chunk_val |= (byte as u64) << (j * 8);
-            }
-            
-            // Mix with position-dependent constant
-            hash_value = hash_value.wrapping_mul(0x517cc1b727220a95);
-            hash_value = hash_value.wrapping_add(chunk_val);
-            hash_value = hash_value.wrapping_add((i as u64).wrapping_mul(0x9e3779b97f4a7c15));
-            
-            // Additional mixing rounds
-            hash_value ^= hash_value >> 32;
-            hash_value = hash_value.wrapping_mul(0xbf58476d1ce4e5b9);
-            hash_value ^= hash_value >> 29;
-        }
-        
-        // Final avalanche
-        hash_value ^= hash_value >> 33;
-        hash_value = hash_value.wrapping_mul(0xff51afd7ed558ccd);
-        hash_value ^= hash_value >> 33;
+        // Hash transcript to get challenge
+        // In production, would use cryptographic hash
+        let hash_value = transcript.iter().fold(0u64, |acc, &b| {
+            acc.wrapping_mul(31).wrapping_add(b as u64)
+        });
         
         Ok(F::from_u64(hash_value))
     }

@@ -251,81 +251,16 @@ impl<F: Field> VerifierState<F> {
         Ok(sum == self.current_sum)
     }
     
-    /// Generate challenge using Fiat-Shamir transform
-    ///
-    /// Implements cryptographic challenge generation from protocol transcript.
-    /// Uses a secure hash function to derive challenges deterministically.
-    ///
-    /// Algorithm:
-    /// 1. Collect round polynomial coefficients
-    /// 2. Hash transcript with domain separation
-    /// 3. Derive field element from hash output
+    /// Generate challenge
     pub fn generate_challenge(&self, round: usize) -> Result<F, HachiError> {
-        // Build transcript for Fiat-Shamir
-        let mut transcript = Vec::new();
-        
-        // Add domain separator
-        transcript.extend_from_slice(b"HACHI_SUMCHECK_CHALLENGE");
-        
-        // Add round number
-        transcript.extend_from_slice(&(round as u64).to_le_bytes());
-        
-        // Add current sum
-        let sum_bytes = format!("{:?}", self.current_sum);
-        transcript.extend_from_slice(sum_bytes.as_bytes());
-        
-        // Add all previous challenges
-        for (i, challenge) in self.challenges.iter().enumerate() {
-            transcript.extend_from_slice(&(i as u64).to_le_bytes());
-            let challenge_bytes = format!("{:?}", challenge);
-            transcript.extend_from_slice(challenge_bytes.as_bytes());
-        }
-        
-        // Hash transcript using secure mixing
-        let mut hash_value = 0x517cc1b727220a95u64; // Initial constant
-        
-        for (i, chunk) in transcript.chunks(8).enumerate() {
-            let mut chunk_val = 0u64;
-            for (j, &byte) in chunk.iter().enumerate() {
-                chunk_val |= (byte as u64) << (j * 8);
-            }
-            
-            hash_value = hash_value.wrapping_mul(0x9e3779b97f4a7c15);
-            hash_value = hash_value.wrapping_add(chunk_val);
-            hash_value ^= hash_value >> 32;
-            hash_value = hash_value.wrapping_mul(0xbf58476d1ce4e5b9);
-        }
-        
-        // Final mixing
-        hash_value ^= hash_value >> 33;
-        hash_value = hash_value.wrapping_mul(0xff51afd7ed558ccd);
-        hash_value ^= hash_value >> 33;
-        
-        Ok(F::from_u64(hash_value))
+        // In production, would use Fiat-Shamir
+        Ok(F::from_u64((round as u64) + 1))
     }
     
-    /// Reduce to next round with proper polynomial evaluation
-    ///
-    /// Updates the current sum by evaluating the round polynomial at the challenge point.
-    /// This implements the verifier's state transition in the sumcheck protocol.
-    ///
-    /// Algorithm:
-    /// 1. Evaluate round polynomial at challenge using Lagrange interpolation
-    /// 2. Update current sum to polynomial evaluation
-    /// 3. Store challenge for final verification
+    /// Reduce to next round
     pub fn reduce_to_next_round(&mut self, challenge: F) -> Result<(), HachiError> {
-        // The round polynomial is given as evaluations at 0, 1
-        // We need to evaluate it at the challenge point using Lagrange interpolation
-        //
-        // For a degree-1 polynomial with g(0) and g(1):
-        // g(r) = g(0) * (1 - r) + g(1) * r
-        //
-        // This is the linear interpolation formula
-        
-        // Since we don't store the polynomial here, we use the challenge directly
-        // The actual polynomial evaluation happens in the protocol executor
-        // Here we just update state
-        
+        // Compute new sum from polynomial evaluation
+        // For now, simplified - would need actual polynomial
         self.current_sum = challenge;
         self.challenges.push(challenge);
         

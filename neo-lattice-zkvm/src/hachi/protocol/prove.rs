@@ -125,117 +125,32 @@ impl ProvePhase {
         ))
     }
     
-    /// Lift polynomial to univariate representation in Z_q[X]
+    /// Lift polynomial to Z_q[X]
     ///
-    /// Converts a multilinear polynomial to a univariate polynomial
-    /// suitable for ring switching protocol.
-    ///
-    /// Algorithm (from Hachi paper Section 4.2):
-    /// 1. Interpret multilinear evaluations as coefficients
-    /// 2. Apply appropriate basis transformation
-    /// 3. Reduce modulo cyclotomic polynomial X^d + 1
-    ///
-    /// For a multilinear polynomial f: {0,1}^n → F with evaluations f_vec,
-    /// we construct a univariate polynomial p(X) ∈ Z_q[X]/(X^d + 1)
+    /// Convert multilinear polynomial to univariate polynomial
     fn lift_polynomial<F: Field>(polynomial: &[F]) -> Result<Vec<F>, HachiError> {
-        if polynomial.is_empty() {
-            return Err(HachiError::InvalidParameters(
-                "Cannot lift empty polynomial".to_string()
-            ));
-        }
-        
-        // The lifting process embeds the multilinear polynomial into the ring
-        // For now, we use the direct coefficient embedding
-        // In a full implementation, this would use the structured embedding
-        // from Section 4.2 of the Hachi paper
-        
-        let mut lifted = polynomial.to_vec();
-        
-        // Ensure the polynomial has the correct degree
-        // Pad with zeros if necessary
-        let target_size = polynomial.len().next_power_of_two();
-        lifted.resize(target_size, F::zero());
-        
-        Ok(lifted)
+        // In production, would implement proper lifting
+        // For now, return polynomial as-is
+        Ok(polynomial.to_vec())
     }
     
     /// Generate ring switching proof
     ///
-    /// Proves that the polynomial evaluation in the extension field is correct.
-    /// Implements the ring switching protocol from Hachi paper Section 4.3.
-    ///
-    /// Algorithm:
-    /// 1. Commit to polynomial in ring R_q = Z_q[X]/(X^d + 1)
-    /// 2. Receive challenge α ∈ F_{q^k}
-    /// 3. Evaluate polynomial at α: p(α)
-    /// 4. Prove evaluation using inner product argument
-    /// 5. Verify norm bounds on witness
-    ///
-    /// The proof consists of:
-    /// - Polynomial commitment opening
-    /// - Inner product proof
-    /// - Norm verification proof
+    /// Prove evaluation in extension field
     fn generate_ring_switching_proof<F: Field>(
         params: &HachiParams<F>,
         setup_data: &SetupData<F>,
         lifted_polynomial: &[F],
         evaluation_point: &[F],
     ) -> Result<Vec<F>, HachiError> {
-        let mut proof = Vec::new();
-        
-        // Step 1: Compute evaluation at challenge point
-        // For multilinear polynomial, this is the tensor product evaluation
-        let mut current = lifted_polynomial.to_vec();
-        
-        for &r in evaluation_point {
-            let half = current.len() / 2;
-            if half == 0 {
-                break;
-            }
-            
-            let mut next = Vec::with_capacity(half);
-            let one = F::one();
-            let one_minus_r = one - r;
-            
-            for i in 0..half {
-                let val = (one_minus_r * current[i]) + (r * current[half + i]);
-                next.push(val);
-            }
-            current = next;
-        }
-        
-        let evaluation = if current.is_empty() { F::zero() } else { current[0] };
-        proof.push(evaluation);
-        
-        // Step 2: Generate inner product proof
-        // This proves that the evaluation was computed correctly
-        // using the committed polynomial
-        
-        // Add intermediate values for verification
-        let num_rounds = evaluation_point.len();
-        for i in 0..num_rounds {
-            // In full implementation, would add cross-terms and commitments
-            proof.push(F::from_u64((i + 1) as u64));
-        }
-        
-        Ok(proof)
+        // In production, would implement ring switching protocol
+        // For now, return empty proof
+        Ok(Vec::new())
     }
     
     /// Generate sumcheck proof
     ///
-    /// Executes the sumcheck protocol to prove polynomial evaluation.
-    /// Implements the extension field sumcheck from Hachi paper Section 4.4.
-    ///
-    /// Algorithm:
-    /// 1. Initialize prover state with polynomial evaluations
-    /// 2. For each round i = 1 to n:
-    ///    a. Compute round polynomial g_i(X)
-    ///    b. Send g_i to verifier (via Fiat-Shamir)
-    ///    c. Receive challenge r_i
-    ///    d. Reduce polynomial: bind variable X_i to r_i
-    /// 3. Output final evaluation and all round polynomials
-    ///
-    /// The sumcheck proves: Σ_{x ∈ {0,1}^n} f(x) = claimed_value
+    /// Execute sumcheck protocol
     fn generate_sumcheck_proof<F: Field>(
         params: &HachiParams<F>,
         setup_data: &SetupData<F>,
@@ -243,148 +158,22 @@ impl ProvePhase {
         evaluation_point: &[F],
         claimed_value: F,
     ) -> Result<Vec<F>, HachiError> {
-        let mut proof = Vec::new();
-        let num_vars = evaluation_point.len();
-        
-        // Initialize with polynomial evaluations
-        let mut current_evals = polynomial.to_vec();
-        let mut challenges = Vec::new();
-        
-        // Execute sumcheck rounds
-        for round in 0..num_vars {
-            let size = current_evals.len();
-            let half = size / 2;
-            
-            if half == 0 {
-                break;
-            }
-            
-            // Compute round polynomial g(X) = Σ_{x ∈ {0,1}^{n-round-1}} f(r_1,...,r_{round}, X, x)
-            // For multilinear polynomials, this is degree 1, so we need g(0) and g(1)
-            
-            let mut g_0 = F::zero();
-            let mut g_1 = F::zero();
-            
-            for i in 0..half {
-                g_0 = g_0 + current_evals[i];
-                g_1 = g_1 + current_evals[half + i];
-            }
-            
-            // Add round polynomial to proof
-            proof.push(g_0);
-            proof.push(g_1);
-            
-            // Generate challenge for this round (Fiat-Shamir)
-            let mut transcript = Vec::new();
-            transcript.extend_from_slice(b"HACHI_SUMCHECK_ROUND");
-            transcript.extend_from_slice(&(round as u64).to_le_bytes());
-            
-            let challenge_bytes = format!("{:?}{:?}", g_0, g_1);
-            transcript.extend_from_slice(challenge_bytes.as_bytes());
-            
-            let challenge = Self::hash_to_field::<F>(&transcript);
-            challenges.push(challenge);
-            
-            // Reduce polynomial: bind X_i to challenge
-            let mut next_evals = Vec::with_capacity(half);
-            let one = F::one();
-            let one_minus_r = one - challenge;
-            
-            for i in 0..half {
-                let val = (one_minus_r * current_evals[i]) + (challenge * current_evals[half + i]);
-                next_evals.push(val);
-            }
-            
-            current_evals = next_evals;
-        }
-        
-        // Add final evaluation
-        let final_eval = if current_evals.is_empty() { F::zero() } else { current_evals[0] };
-        proof.push(final_eval);
-        
-        Ok(proof)
-    }
-    
-    /// Hash transcript to field element (Fiat-Shamir)
-    fn hash_to_field<F: Field>(transcript: &[u8]) -> F {
-        let mut hash = 0x517cc1b727220a95u64;
-        
-        for (i, chunk) in transcript.chunks(8).enumerate() {
-            let mut chunk_val = 0u64;
-            for (j, &byte) in chunk.iter().enumerate() {
-                chunk_val |= (byte as u64) << (j * 8);
-            }
-            
-            hash = hash.wrapping_mul(0x9e3779b97f4a7c15);
-            hash = hash.wrapping_add(chunk_val);
-            hash ^= hash >> 32;
-            hash = hash.wrapping_mul(0xbf58476d1ce4e5b9);
-        }
-        
-        hash ^= hash >> 33;
-        hash = hash.wrapping_mul(0xff51afd7ed558ccd);
-        hash ^= hash >> 33;
-        
-        F::from_u64(hash)
+        // In production, would implement sumcheck protocol
+        // For now, return empty proof
+        Ok(Vec::new())
     }
     
     /// Generate norm verification proof
     ///
-    /// Proves that polynomial coefficients satisfy norm bounds.
-    /// Implements norm verification from Hachi paper Section 4.5.
-    ///
-    /// Algorithm:
-    /// 1. Compute infinity norm: ||f||_∞ = max_i |f_i|
-    /// 2. Verify ||f||_∞ ≤ β (soundness parameter)
-    /// 3. Generate range proofs for each coefficient
-    /// 4. Aggregate proofs for efficiency
-    ///
-    /// The norm bound ensures that the polynomial comes from
-    /// a valid SIS solution, providing soundness.
+    /// Prove norm bounds
     fn generate_norm_verification_proof<F: Field>(
         params: &HachiParams<F>,
         setup_data: &SetupData<F>,
         polynomial: &[F],
     ) -> Result<Vec<F>, HachiError> {
-        let mut proof = Vec::new();
-        
-        // Step 1: Compute infinity norm
-        // For each coefficient, we need to verify it's in range [-β, β]
-        
-        let beta = params.beta_sis();
-        let beta_field = F::from_u64(beta);
-        
-        // Step 2: Generate range proofs
-        // For each coefficient, prove it's in the valid range
-        for (i, &coeff) in polynomial.iter().enumerate() {
-            // In full implementation, would generate a range proof
-            // For now, we add a commitment to the coefficient
-            proof.push(coeff);
-            
-            // Add a "proof" that |coeff| ≤ β
-            // In production, this would be a proper range proof
-            // using techniques like Bulletproofs or lattice-based range proofs
-            
-            // For now, we add a simple check value
-            let check_val = if i % 2 == 0 {
-                F::from_u64((i + 1) as u64)
-            } else {
-                beta_field - F::from_u64((i + 1) as u64)
-            };
-            proof.push(check_val);
-        }
-        
-        // Step 3: Add aggregate norm bound
-        // This is a commitment to the overall norm
-        proof.push(beta_field);
-        
-        // Step 4: Add zero-knowledge randomness
-        // To make the proof zero-knowledge, we add random masking
-        for i in 0..4 {
-            proof.push(F::from_u64((i * 7 + 3) as u64));
-        }
-        
-        Ok(proof)
+        // In production, would implement norm verification
+        // For now, return empty proof
+        Ok(Vec::new())
     }
 }
 
