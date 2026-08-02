@@ -1,6 +1,7 @@
 // Neo Lattice zkVM - Complete Post-Quantum Zero-Knowledge Virtual Machine
 // Synthesizes primitives from Quasar, SALSAA, Neo, Symphony, and Sum-check Survey papers
 
+pub mod errors;
 pub mod field;
 pub mod ring;
 pub mod polynomial;
@@ -18,6 +19,12 @@ pub mod streaming;
 pub mod serialization;
 pub mod constraint_systems;
 pub mod small_space_zkvm;
+
+// Cyclo: Lightweight Lattice-based Folding via Partial Range Checks
+pub mod cyclo;
+
+// RoKoko: Lattice-based Succinct Arguments with Committed Refinement
+pub mod rokoko;
 
 // Re-export commonly used types
 pub use field::{Field, GoldilocksField};
