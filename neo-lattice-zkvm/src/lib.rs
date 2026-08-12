@@ -26,6 +26,9 @@ pub mod cyclo;
 // RoKoko: Lattice-based Succinct Arguments with Committed Refinement
 pub mod rokoko;
 
+// ProtogaLattice: Constant-Round Lattice-based Folding for General Polynomial Relations
+pub mod protogalattice;
+
 // Re-export commonly used types
 pub use field::{Field, GoldilocksField};
 pub use ring::{CyclotomicRing, RingElement};

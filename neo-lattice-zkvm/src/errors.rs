@@ -100,3 +100,68 @@ impl From<bincode::Error> for ZKVMError {
 
 /// Result type alias for zkVM operations
 pub type ZKVMResult<T> = Result<T, ZKVMError>;
+
+/// Error types for ProtogaLattice protocol
+#[derive(Debug, Clone)]
+pub enum ProtogaError {
+    /// Invalid parameters provided
+    InvalidParameters(String),
+    
+    /// Invalid witness
+    InvalidWitness(String),
+    
+    /// Invalid proof
+    InvalidProof(String),
+    
+    /// Commitment error
+    CommitmentError(String),
+    
+    /// Folding error
+    FoldingError(String),
+    
+    /// Verification failed
+    VerificationFailed(String),
+    
+    /// Transcript error
+    TranscriptError(String),
+    
+    /// Lattice operation error
+    LatticeError(String),
+    
+    /// Serialization error
+    SerializationError(String),
+    
+    /// Internal error
+    InternalError(String),
+}
+
+impl fmt::Display for ProtogaError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ProtogaError::InvalidParameters(msg) => write!(f, "Invalid parameters: {}", msg),
+            ProtogaError::InvalidWitness(msg) => write!(f, "Invalid witness: {}", msg),
+            ProtogaError::InvalidProof(msg) => write!(f, "Invalid proof: {}", msg),
+            ProtogaError::CommitmentError(msg) => write!(f, "Commitment error: {}", msg),
+            ProtogaError::FoldingError(msg) => write!(f, "Folding error: {}", msg),
+            ProtogaError::VerificationFailed(msg) => write!(f, "Verification failed: {}", msg),
+            ProtogaError::TranscriptError(msg) => write!(f, "Transcript error: {}", msg),
+            ProtogaError::LatticeError(msg) => write!(f, "Lattice error: {}", msg),
+            ProtogaError::SerializationError(msg) => write!(f, "Serialization error: {}", msg),
+            ProtogaError::InternalError(msg) => write!(f, "Internal error: {}", msg),
+        }
+    }
+}
+
+impl Error for ProtogaError {}
+
+impl From<ZKVMError> for ProtogaError {
+    fn from(err: ZKVMError) -> Self {
+        ProtogaError::InternalError(err.to_string())
+    }
+}
+
+impl From<std::io::Error> for ProtogaError {
+    fn from(err: std::io::Error) -> Self {
+        ProtogaError::SerializationError(err.to_string())
+    }
+}
